@@ -1,0 +1,64 @@
+{
+  "name": "stellalib",
+  "version": "1.0.0",
+  "description": "StellaLib — A powerful Lavalink v3+v4 client for TypeScript with auto version detection, session persistence, smart autoplay, and graceful shutdown",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prepublishOnly": "npm run clean && npm run build",
+    "test": "bun test",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "lavalink",
+    "lavalink-client",
+    "lavalink-v4",
+    "discord",
+    "discord-music",
+    "music-bot",
+    "audio",
+    "voice",
+    "autoplay",
+    "session-resume",
+    "stellalib",
+    "typescript"
+  ],
+  "license": "OSL-3.0",
+  "author": "AntonyZ, x2sadddDM, SynX, Astel",
+  "homepage": "https://github.com/Roki-Stella-Projects/StellaLib",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Roki-Stella-Projects/StellaLib.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Roki-Stella-Projects/StellaLib/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "tiny-typed-emitter": "^2.1.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/ws": "^8.18.0",
+    "bun-types": "^1.0.0",
+    "discord.js": "^14.18.0",
+    "typescript": "~5.7.3"
+  }
+}

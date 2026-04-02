@@ -1,0 +1,26 @@
+# Source
+src/
+examples/
+tsconfig.json
+
+# Dev files
+.gitignore
+.env
+*.tsbuildinfo
+bun.lock
+
+# IDE
+.vscode/
+.idea/
+.windsurf/
+
+# Tests
+test/
+__tests__/
+*.test.ts
+*.spec.ts
+
+# Misc
+node_modules/
+.github/
+sessions.json
