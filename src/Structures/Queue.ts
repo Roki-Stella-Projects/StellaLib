@@ -34,6 +34,12 @@ export class StellaQueue extends Array<Track | UnresolvedTrack> {
 	/** The previous track. */
 	public previous: Track | UnresolvedTrack | null = null;
 
+	/** Maximum queue size (0 = unlimited). Set by Player. */
+	public maxSize = 0;
+
+	/** Whether to prevent duplicate tracks from being added. */
+	public noDuplicates = false;
+
 	/**
 	 * Adds a track to the queue.
 	 * @param track The track or array of tracks to add.
@@ -45,6 +51,30 @@ export class StellaQueue extends Array<Track | UnresolvedTrack> {
 	): void {
 		if (!TrackUtils.validate(track))
 			throw new RangeError('Track must be a "Track" or "Track[]".');
+
+		// Deduplication: filter out tracks already in the queue or currently playing
+		if (this.noDuplicates) {
+			if (Array.isArray(track)) {
+				track = track.filter((t) => !this.isDuplicate(t));
+				if (!track.length) return;
+			} else {
+				if (this.isDuplicate(track)) return;
+			}
+		}
+
+		// Max size enforcement
+		if (this.maxSize > 0 && this.current) {
+			const incoming = Array.isArray(track) ? track.length : 1;
+			const available = this.maxSize - this.length;
+			if (available <= 0) {
+				throw new RangeError(`Queue is full (${this.maxSize} tracks max).`);
+			}
+			if (incoming > available) {
+				if (Array.isArray(track)) {
+					track = track.slice(0, available);
+				}
+			}
+		}
 
 		if (!this.current) {
 			if (Array.isArray(track)) {
@@ -73,6 +103,29 @@ export class StellaQueue extends Array<Track | UnresolvedTrack> {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Checks if a track is already in the queue or is currently playing.
+	 * Matches by URI first, then by title+author combo.
+	 */
+	public isDuplicate(track: Track | UnresolvedTrack): boolean {
+		const uri = (track as Track).uri;
+		const key = `${track.title}::${track.author}`;
+
+		// Check current track
+		if (this.current) {
+			const curUri = (this.current as Track).uri;
+			if (uri && curUri && uri === curUri) return true;
+			if (`${this.current.title}::${this.current.author}` === key) return true;
+		}
+
+		// Check queued tracks
+		return this.some((t) => {
+			const tUri = (t as Track).uri;
+			if (uri && tUri && uri === tUri) return true;
+			return `${t.title}::${t.author}` === key;
+		});
 	}
 
 	/**

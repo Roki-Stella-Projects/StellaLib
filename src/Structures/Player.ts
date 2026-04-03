@@ -22,6 +22,8 @@ import type {
 	EqualizerBand,
 	TrackPluginInfo,
 	PlayerStateSnapshot,
+	PlayerPersistData,
+	TrackPersistData,
 } from "./Types";
 import type { StellaManager } from "./Manager";
 import type { StellaNode } from "./Node";
@@ -80,9 +82,16 @@ export class StellaPlayer {
 	/** The ping to the voice server in ms. */
 	public ping = -1;
 
+	/** Inactivity timeout in ms (0 = disabled). Auto-disconnect when alone in VC. */
+	public inactivityTimeout: number;
+	/** Maximum queue size (0 = unlimited). */
+	public maxQueueSize: number;
+
 	private static _manager: StellaManager;
 	private readonly data: Record<string, unknown> = {};
 	private dynamicLoopInterval?: ReturnType<typeof setInterval>;
+	/** Timer for inactivity auto-disconnect. */
+	private inactivityTimer?: ReturnType<typeof setTimeout>;
 
 	/** Whether the voice connection handshake is complete. */
 	public voiceReady = false;
@@ -137,6 +146,9 @@ export class StellaPlayer {
 		this.node = node || this.manager.useableNodes;
 
 		if (!this.node) throw new RangeError("No available nodes.");
+
+		this.inactivityTimeout = options.inactivityTimeout ?? 0;
+		this.maxQueueSize = options.maxQueueSize ?? 0;
 
 		this.manager.players.set(options.guild, this);
 		this.manager.emit("PlayerCreate", this);
@@ -217,20 +229,45 @@ export class StellaPlayer {
 			throw new RangeError("No nodes available.");
 		if (this.node.options.identifier === targetId) return this;
 
+		// Clean up dynamic repeat interval during move
+		if (this.dynamicLoopInterval) {
+			clearInterval(this.dynamicLoopInterval);
+			this.dynamicLoopInterval = undefined;
+		}
+
 		const currentNode = this.node;
 		const destinationNode = this.manager.nodes.get(targetId)!;
 		let position = this.position;
 
+		// Try to fetch accurate position from source node (may be dead during failover)
 		if (currentNode.connected) {
 			try {
-					const fetchedPlayer = (await currentNode.rest.getPlayer(this.guild)
+				const fetchedPlayer = (await currentNode.rest.getPlayer(this.guild)
 				) as { track?: { info?: { position?: number } } } | null;
 				position = fetchedPlayer?.track?.info?.position ?? this.position;
 			} catch {
-				// Use local position
+				// Use local position — source node may be dead
 			}
 		}
 
+		this.state = "MOVING";
+
+		// Send voice connection first so Lavalink can join the voice channel
+		if (this.voiceState?.sessionId && this.voiceState?.event) {
+			await destinationNode.rest.updatePlayer({
+				guildId: this.guild,
+				data: {
+					voice: {
+						token: this.voiceState.event.token,
+						endpoint: this.voiceState.event.endpoint,
+						sessionId: this.voiceState.sessionId,
+						channelId: this.voiceChannel ?? undefined,
+					},
+				},
+			});
+		}
+
+		// Now send track + position + volume + filters to resume playback
 		await destinationNode.rest.updatePlayer({
 			guildId: this.guild,
 			data: {
@@ -250,28 +287,19 @@ export class StellaPlayer {
 			},
 		});
 
-		// Send voice state to the new node (with channelId)
-		if (this.voiceState?.sessionId) {
-			await destinationNode.rest.updatePlayer({
-				guildId: this.guild,
-				data: {
-					voice: {
-						token: this.voiceState.event?.token,
-						endpoint: this.voiceState.event?.endpoint,
-						sessionId: this.voiceState.sessionId,
-						channelId: this.voiceChannel ?? undefined,
-					},
-				},
-			});
-		}
-
+		// Switch node reference
+		const oldNodeId = currentNode.options.identifier!;
 		this.node = destinationNode;
-		this.state = "MOVING";
 
-		// Destroy player on old node
+		// Destroy player on old node (best-effort, may be dead)
 		if (currentNode.connected) {
 			currentNode.rest.destroyPlayer(this.guild).catch(() => {});
 		}
+
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Moved from ${oldNodeId} → ${destinationNode.options.identifier} (pos: ${position}ms)`,
+		);
 
 		setTimeout(() => {
 			if (this.state === "MOVING") this.state = "CONNECTED";
@@ -284,6 +312,12 @@ export class StellaPlayer {
 	public disconnect(): this {
 		if (this.voiceChannel === null) return this;
 		this.state = "DISCONNECTING";
+
+		// Clean up dynamic repeat interval
+		if (this.dynamicLoopInterval) {
+			clearInterval(this.dynamicLoopInterval);
+			this.dynamicLoopInterval = undefined;
+		}
 
 		this.pause(true);
 		this.manager.options.send(this.guild, {
@@ -312,6 +346,9 @@ export class StellaPlayer {
 			this.dynamicLoopInterval = undefined;
 		}
 
+		// Clean up inactivity timer
+		this.stopInactivityTimer();
+
 		// Clear pending voice resolvers
 		this.voiceReadyResolvers = [];
 		this.voiceReady = false;
@@ -319,6 +356,13 @@ export class StellaPlayer {
 		if (disconnect) this.disconnect();
 
 		this.node.rest.destroyPlayer(this.guild).catch(() => {});
+
+		// Delete persisted player state so it doesn't resurrect on next restart
+		const store = this.manager.getPlayerStateStore();
+		if (store) {
+			Promise.resolve(store.deletePlayerState(this.guild)).catch(() => {});
+		}
+
 		this.manager.emit("PlayerDestroy", this);
 		this.manager.players.delete(this.guild);
 	}
@@ -668,6 +712,59 @@ export class StellaPlayer {
 		for (const resolve of resolvers) resolve();
 	}
 
+	// ── Inactivity Timer ──────────────────────────────────────────────────
+
+	/**
+	 * Starts the inactivity timer. When it fires, the player auto-disconnects.
+	 * Call this when the bot detects it's alone in the voice channel.
+	 */
+	public startInactivityTimer(): void {
+		if (!this.inactivityTimeout || this.inactivityTimeout <= 0) return;
+		this.stopInactivityTimer();
+
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Alone in voice channel — auto-disconnect in ${this.inactivityTimeout}ms`,
+		);
+
+		this.inactivityTimer = setTimeout(() => {
+			this.manager.emit(
+				"Debug",
+				`[Player:${this.guild}] Inactivity timeout reached — destroying player`,
+			);
+			this.destroy();
+		}, this.inactivityTimeout);
+	}
+
+	/** Stops the inactivity timer (e.g., when someone joins the voice channel). */
+	public stopInactivityTimer(): void {
+		if (this.inactivityTimer) {
+			clearTimeout(this.inactivityTimer);
+			this.inactivityTimer = undefined;
+		}
+	}
+
+	// ── Queue Size Enforcement ────────────────────────────────────────────
+
+	/**
+	 * Checks if the queue can accept more tracks.
+	 * @param count Number of tracks to add (default 1).
+	 * @returns true if the queue has room, false otherwise.
+	 */
+	public canAddToQueue(count = 1): boolean {
+		if (!this.maxQueueSize || this.maxQueueSize <= 0) return true;
+		return this.queue.length + count <= this.maxQueueSize;
+	}
+
+	/**
+	 * Returns how many more tracks can be added to the queue.
+	 * Returns Infinity if no limit is set.
+	 */
+	public get queueSpaceRemaining(): number {
+		if (!this.maxQueueSize || this.maxQueueSize <= 0) return Infinity;
+		return Math.max(0, this.maxQueueSize - this.queue.length);
+	}
+
 	/**
 	 * Returns a snapshot of the player's current state.
 	 * Useful for persistence, debugging, or manual resume.
@@ -694,5 +791,120 @@ export class StellaPlayer {
 			queueRepeat: this.queueRepeat,
 			dynamicRepeat: this.dynamicRepeat,
 		};
+	}
+
+	/** Helper to serialize a Track into TrackPersistData. */
+	private static trackToPersist(t: Track | UnresolvedTrack): TrackPersistData {
+		return {
+			encoded: (t as Track).track ?? "",
+			title: t.title ?? "",
+			author: t.author ?? "",
+			uri: (t as Track).uri ?? "",
+			duration: t.duration ?? 0,
+			sourceName: (t as Track).sourceName ?? "unknown",
+			identifier: (t as Track).identifier ?? "",
+			artworkUrl: (t as Track).artworkUrl ?? "",
+			isrc: (t as Track).isrc ?? "",
+			isSeekable: (t as Track).isSeekable ?? true,
+			isStream: (t as Track).isStream ?? false,
+		};
+	}
+
+	/**
+	 * Returns the full player state for persistence across restarts.
+	 * Includes autoplay state, queue, filters, seed pool, and history.
+	 */
+	public getFullState(): PlayerPersistData {
+		const botUser = this.get<{ id?: string } | string>("Internal_BotUser");
+		const botUserId = typeof botUser === "string" ? botUser : botUser?.id ?? null;
+
+		return {
+			guildId: this.guild,
+			voiceChannelId: this.voiceChannel,
+			textChannelId: this.textChannel,
+			nodeIdentifier: this.node.options.identifier!,
+			currentTrack: this.queue.current ? StellaPlayer.trackToPersist(this.queue.current) : null,
+			position: this.position,
+			volume: this.volume,
+			paused: this.paused,
+			trackRepeat: this.trackRepeat,
+			queueRepeat: this.queueRepeat,
+			dynamicRepeat: this.dynamicRepeat,
+			isAutoplay: this.isAutoplay,
+			botUserId,
+			autoplayHistory: this.autoplayHistory,
+			autoplaySeedPool: [...this.autoplaySeedPool],
+			queue: this.queue.map((t) => StellaPlayer.trackToPersist(t)),
+			filters: {
+				distortion: this.filters.distortion,
+				equalizer: this.filters.equalizer,
+				karaoke: this.filters.karaoke,
+				rotation: this.filters.rotation,
+				timescale: this.filters.timescale,
+				vibrato: this.filters.vibrato,
+				volume: this.filters.volume,
+				activeFilters: this.filters.getActiveFilters(),
+			},
+		};
+	}
+
+	/**
+	 * Restores player state from persisted data (used after bot restart + session resume).
+	 * Restores autoplay, filters, history, seed pool, repeat modes, and queue.
+	 */
+	public restoreFromState(state: PlayerPersistData): void {
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Restoring state — autoplay: ${state.isAutoplay}, queue: ${state.queue.length} tracks, filters: ${Object.entries(state.filters.activeFilters).filter(([, v]) => v).map(([k]) => k).join(",") || "none"}`,
+		);
+
+		// Restore autoplay state
+		this.isAutoplay = state.isAutoplay;
+		if (state.botUserId) {
+			this.set("Internal_BotUser", { id: state.botUserId });
+		}
+
+		// Restore autoplay history and seed pool
+		this.autoplayHistory = state.autoplayHistory ?? [];
+		this.autoplaySeedPool = state.autoplaySeedPool ?? [];
+
+		// Restore repeat modes
+		this.trackRepeat = state.trackRepeat;
+		this.queueRepeat = state.queueRepeat;
+		this.dynamicRepeat = state.dynamicRepeat;
+
+		// Restore volume
+		this.volume = state.volume;
+
+		// Restore filters (local state only — Lavalink already has them if session resumed)
+		if (state.filters) {
+			this.filters.restoreState(state.filters);
+		}
+
+		// Restore queue tracks
+		if (state.queue?.length) {
+			const tracks = state.queue.map((td) =>
+				TrackUtils.build(
+					{
+						encoded: td.encoded,
+						info: {
+							title: td.title,
+							author: td.author,
+							uri: td.uri,
+							length: td.duration,
+							identifier: td.identifier,
+							artworkUrl: td.artworkUrl,
+							isrc: td.isrc,
+							isSeekable: td.isSeekable,
+							isStream: td.isStream,
+							sourceName: td.sourceName,
+						},
+						pluginInfo: {},
+					},
+					state.botUserId ?? undefined,
+				),
+			);
+			this.queue.push(...tracks);
+		}
 	}
 }

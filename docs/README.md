@@ -17,6 +17,8 @@ Welcome to the StellaLib wiki-style documentation. These guides cover everything
 | 09 | [Session Persistence](09-session-persistence.md) | FileSessionStore, custom stores, resume flow |
 | 10 | [Multi-Version Support](10-multi-version.md) | Lavalink v3 + v4 — detection, protocol differences, compatibility |
 | 11 | [Autoplay Engine](11-autoplay.md) | Smart auto-mix — seeds, scoring, recommendations, fallback chain |
+| 12 | [Player State Persistence](12-player-state-persistence.md) | Full player state persistence — autoplay, queue, filters survive restarts |
+| 13 | [Seamless Failover](13-seamless-failover.md) | Multi-layer node failover — automatic, proactive, and zero-interruption |
 
 ## Quick Links
 

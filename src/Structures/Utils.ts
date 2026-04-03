@@ -251,9 +251,25 @@ function getStructures(): Extendable {
 	return structures;
 }
 
+/**
+ * Type guard: checks if an object implements the PlayerStateStore interface.
+ * Useful for validating custom stores before passing them to ManagerOptions.
+ */
+function isPlayerStateStore(obj: unknown): boolean {
+	if (!obj || typeof obj !== "object") return false;
+	const o = obj as Record<string, unknown>;
+	return (
+		typeof o.getPlayerState === "function" &&
+		typeof o.setPlayerState === "function" &&
+		typeof o.deletePlayerState === "function" &&
+		typeof o.getAllPlayerStates === "function"
+	);
+}
+
 export {
 	TrackUtils,
 	Structure,
 	Plugin,
 	Extendable,
+	isPlayerStateStore,
 };

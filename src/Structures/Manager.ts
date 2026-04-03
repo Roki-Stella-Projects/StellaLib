@@ -28,6 +28,7 @@ import type {
 	ManagerOptions,
 	ManagerEvents,
 	Payload,
+	PlayerStateStore,
 } from "./Types";
 import type { StellaNode } from "./Node";
 import type { StellaPlayer } from "./Player";
@@ -63,6 +64,10 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 	public caches: LRUCache<string, SearchResult>;
 	/** Whether the manager is shutting down. */
 	private shuttingDown = false;
+	/** Reference to cache prune interval for cleanup. */
+	private pruneInterval?: ReturnType<typeof setInterval>;
+	/** Reference to node health check interval for cleanup. */
+	private healthCheckInterval?: ReturnType<typeof setInterval>;
 
 	/** Returns the nodes sorted by least CPU load. */
 	public get leastLoadNode(): Map<string, StellaNode> {
@@ -197,7 +202,7 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 
 		// Periodic LRU cache pruning (removes expired entries)
 		if (cacheOpts?.enabled && cacheOpts.time > 0) {
-			setInterval(() => {
+			this.pruneInterval = setInterval(() => {
 				const pruned = this.caches.prune();
 				if (pruned > 0) {
 					this.emit("Debug", `[Cache] Pruned ${pruned} expired entries (${this.caches.size} remaining)`);
@@ -227,8 +232,67 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 		}
 
 		this.initiated = true;
+
+		// Start node health monitoring if thresholds are configured
+		const health = this.options.nodeHealthThresholds;
+		if (health) {
+			const interval = health.checkInterval ?? 60000;
+			this.healthCheckInterval = setInterval(() => this.checkNodeHealth(), interval);
+			this.emit("Debug", `[Manager] Node health monitor started (every ${interval}ms)`);
+		}
+
 		this.emit("Debug", "[Manager] Initialized");
 		return this;
+	}
+
+	/**
+	 * Checks node health and preemptively migrates players from overloaded nodes.
+	 * Called periodically when `nodeHealthThresholds` is configured.
+	 */
+	private checkNodeHealth(): void {
+		const thresholds = this.options.nodeHealthThresholds;
+		if (!thresholds) return;
+
+		const maxCpu = thresholds.maxCpuLoad ?? 0.9;
+		const maxDeficit = thresholds.maxFrameDeficit ?? 500;
+
+		for (const node of this.nodes.values()) {
+			if (!node.connected) continue;
+
+			const cpuLoad = node.stats.cpu
+				? node.stats.cpu.lavalinkLoad / node.stats.cpu.cores
+				: 0;
+			const frameDeficit = node.stats.frameStats?.deficit ?? 0;
+
+			const isOverloaded = cpuLoad > maxCpu || frameDeficit > maxDeficit;
+			if (!isOverloaded) continue;
+
+			// Find a healthier node to migrate players to
+			const healthyTarget = [...this.nodes.values()].find((n) => {
+				if (n === node || !n.connected) return false;
+				const nCpu = n.stats.cpu ? n.stats.cpu.lavalinkLoad / n.stats.cpu.cores : 0;
+				return nCpu < maxCpu * 0.7; // Only migrate to nodes well under threshold
+			});
+
+			if (!healthyTarget) continue;
+
+			const playersOnNode = [...this.players.values()].filter((p) => p.node === node);
+			if (!playersOnNode.length) continue;
+
+			this.emit(
+				"Debug",
+				`[HealthCheck] Node ${node.options.identifier} overloaded (CPU: ${(cpuLoad * 100).toFixed(1)}%, deficit: ${frameDeficit}) — migrating ${playersOnNode.length} players to ${healthyTarget.options.identifier}`,
+			);
+
+			for (const player of playersOnNode) {
+				player.moveNode(healthyTarget.options.identifier).catch((err) => {
+					this.emit(
+						"Debug",
+						`[HealthCheck] Failed to migrate player ${player.guild}: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				});
+			}
+		}
 	}
 
 	/**
@@ -244,7 +308,8 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 		if (!node) throw new Error("No available nodes.");
 
 		if (this.options.caches?.enabled && typeof query === "string") {
-			const cached = this.caches.get(query);
+			const cacheKey = query.trim().toLowerCase();
+			const cached = this.caches.get(cacheKey);
 			if (cached) return cached;
 		}
 
@@ -345,7 +410,8 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 				}
 
 				if (this.options.caches?.enabled) {
-					this.caches.set(search, result);
+					const cacheKey = (typeof query === "string" ? query : rawQuery).trim().toLowerCase();
+					this.caches.set(cacheKey, result);
 				}
 
 				if (platform !== primarySource) {
@@ -457,13 +523,27 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 
 	/**
 	 * Destroys a node if it exists.
+	 * Node.destroy() handles failover and cleanup, then removes itself from the map.
 	 * @param identifier
 	 */
 	public destroyNode(identifier: string): void {
 		const node = this.nodes.get(identifier);
 		if (!node) return;
 		node.destroy();
-		this.nodes.delete(identifier);
+	}
+
+	/**
+	 * Returns the player state store (explicit or auto-detected from sessionStore).
+	 * Used internally by Node to restore player state after session resume.
+	 */
+	public getPlayerStateStore(): PlayerStateStore | null {
+		if (this.options.playerStateStore) return this.options.playerStateStore;
+		// Auto-detect: FileSessionStore implements PlayerStateStore
+		const ss = this.options.sessionStore;
+		if (ss && "getPlayerState" in ss && typeof (ss as any).getPlayerState === "function") {
+			return ss as unknown as PlayerStateStore;
+		}
+		return null;
 	}
 
 	/**
@@ -577,6 +657,20 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 
 		this.emit("Debug", "[Manager] Graceful shutdown initiated...");
 
+		// Persist all player states before closing (autoplay, queue, filters survive restart)
+		const playerStore = this.getPlayerStateStore();
+		if (playerStore) {
+			for (const [guildId, player] of this.players) {
+				try {
+					const state = player.getFullState();
+					await playerStore.setPlayerState(guildId, state);
+					this.emit("Debug", `[Manager] Persisted player state for guild ${guildId} (autoplay: ${state.isAutoplay}, queue: ${state.queue.length})`);
+				} catch {
+					// Best effort
+				}
+			}
+		}
+
 		// Gracefully close all nodes (persists session IDs for resume)
 		const closePromises: Promise<void>[] = [];
 		for (const node of this.nodes.values()) {
@@ -594,10 +688,18 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 			}
 		}
 
-		// Clear caches
+		// Clear caches, prune interval, and health check interval
+		if (this.pruneInterval) {
+			clearInterval(this.pruneInterval);
+			this.pruneInterval = undefined;
+		}
+		if (this.healthCheckInterval) {
+			clearInterval(this.healthCheckInterval);
+			this.healthCheckInterval = undefined;
+		}
 		this.caches.clear();
 
-		this.emit("Debug", `[Manager] Shutdown complete. ${this.nodes.size} nodes closed, sessions persisted.`);
+		this.emit("Debug", `[Manager] Shutdown complete. ${this.nodes.size} nodes closed, sessions + player states persisted.`);
 	}
 
 	/**

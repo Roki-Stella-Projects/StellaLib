@@ -281,14 +281,33 @@ class StellaNode {
 		this.socket.on("pong", this.heartbeatAck.bind(this));
 	}
 
-	/** Destroys the Node and all players connected with it. */
+	/** Destroys the Node. Attempts to move players to other healthy nodes first (auto-failover). */
 	public destroy(): void {
-		if (!this.connected) return;
+		if (!this.connected && !this.socket) return;
 
 		this.stopHeartbeat();
 
-		for (const [, p] of this.manager.players) {
-			if (p.node === this) p.destroy();
+		// Auto-failover: try to move players to other healthy nodes instead of destroying them
+		const affectedPlayers = [...this.manager.players.values()].filter((p) => p.node === this);
+		const healthyNodes = [...this.manager.nodes.values()].filter(
+			(n) => n !== this && n.connected,
+		);
+
+		for (const player of affectedPlayers) {
+			if (healthyNodes.length > 0) {
+				// Pick the least-loaded healthy node
+				const target = healthyNodes.sort((a, b) => a.penalties - b.penalties)[0];
+				this.manager.emit(
+					"Debug",
+					`[Node:${this.options.identifier}] Failover: moving player ${player.guild} → ${target.options.identifier}`,
+				);
+				player.moveNode(target.options.identifier).catch(() => {
+					// If move fails, destroy the player
+					player.destroy();
+				});
+			} else {
+				player.destroy();
+			}
 		}
 
 		this.socket?.close(1000, "destroy");
@@ -300,7 +319,7 @@ class StellaNode {
 		if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
 
 		this.manager.emit("NodeDestroy", this);
-		this.manager.destroyNode(this.options.identifier!);
+		this.manager.nodes.delete(this.options.identifier!);
 	}
 
 	/** Gracefully closes the connection, persisting the session for resume. */
@@ -370,15 +389,23 @@ class StellaNode {
 
 	/**
 	 * Reconnects to the node with exponential backoff + jitter.
+	 * First attempt uses a fast retry (2s) for quick recovery from transient failures.
 	 * Jitter prevents thundering herd when multiple nodes reconnect simultaneously.
 	 */
 	private reconnect(): void {
 		const baseDelay = this.options.retryDelay ?? 60000;
 		const maxDelay = 120000;
-		const exponentialDelay = Math.min(baseDelay * Math.pow(1.5, this.reconnectAttempts - 1), maxDelay);
-		// Add ±25% jitter
-		const jitter = exponentialDelay * (0.75 + Math.random() * 0.5);
-		const delay = Math.floor(jitter);
+
+		// Fast retry for first attempt — most disconnects are transient
+		let delay: number;
+		if (this.reconnectAttempts <= 1) {
+			delay = 2000 + Math.floor(Math.random() * 1000);
+		} else {
+			const exponentialDelay = Math.min(baseDelay * Math.pow(1.5, this.reconnectAttempts - 1), maxDelay);
+			// Add ±25% jitter
+			const jitter = exponentialDelay * (0.75 + Math.random() * 0.5);
+			delay = Math.floor(jitter);
+		}
 
 		this.manager.emit(
 			"Debug",
@@ -437,6 +464,8 @@ class StellaNode {
 				this,
 				new Error(`[Node:${this.options.identifier}] Fatal close code ${code}: ${reasonStr}. Not reconnecting.`),
 			);
+			// Even on fatal, try to rescue playing players
+			this.attemptSeamlessFailover("fatal_close");
 			return;
 		}
 
@@ -452,7 +481,77 @@ class StellaNode {
 			}
 		}
 
-		if (code !== 1000 || reasonStr !== "destroy") this.reconnect();
+		// Seamless failover: immediately move playing players to healthy nodes
+		// instead of waiting for this node to reconnect (which may take seconds)
+		if (code !== 1000 || reasonStr !== "destroy") {
+			this.attemptSeamlessFailover("unexpected_close");
+			this.reconnect();
+		}
+	}
+
+	/**
+	 * Attempts to seamlessly move all players from this (dead) node to healthy nodes.
+	 * Preserves current track position so audio continues without interruption.
+	 * Players that fail to move are left for the reconnect cycle to recover.
+	 */
+	private attemptSeamlessFailover(reason: string): void {
+		const affectedPlayers = [...this.manager.players.values()].filter(
+			(p) => p.node === this && (p.playing || p.paused),
+		);
+
+		if (!affectedPlayers.length) return;
+
+		const healthyNodes = [...this.manager.nodes.values()].filter(
+			(n) => n !== this && n.connected,
+		);
+
+		if (!healthyNodes.length) {
+			this.manager.emit(
+				"Debug",
+				`[Failover:${this.options.identifier}] No healthy nodes available — ${affectedPlayers.length} player(s) waiting for reconnect`,
+			);
+			return;
+		}
+
+		// Sort healthy nodes by penalty (best first)
+		healthyNodes.sort((a, b) => a.penalties - b.penalties);
+
+		this.manager.emit(
+			"Debug",
+			`[Failover:${this.options.identifier}] Seamless failover triggered (${reason}) — moving ${affectedPlayers.length} player(s) to healthy nodes`,
+		);
+
+		for (const player of affectedPlayers) {
+			// Distribute players across available nodes (round-robin by penalty)
+			const targetNode = healthyNodes.reduce((best, n) => {
+				const bestLoad = [...this.manager.players.values()].filter((p) => p.node === best).length;
+				const nLoad = [...this.manager.players.values()].filter((p) => p.node === n).length;
+				return nLoad < bestLoad ? n : best;
+			}, healthyNodes[0]);
+
+			const oldNodeId = this.options.identifier!;
+			const newNodeId = targetNode.options.identifier!;
+
+			this.manager.emit(
+				"Debug",
+				`[Failover] Moving player ${player.guild} (pos: ${player.position}ms) → ${newNodeId}`,
+			);
+
+			player.moveNode(newNodeId)
+				.then(() => {
+					this.manager.emit("PlayerFailover", player, oldNodeId, newNodeId);
+					this.manager.emit(
+						"Debug",
+						`[Failover] Player ${player.guild} successfully moved to ${newNodeId} — playback continues`,
+					);
+				})
+				.catch((err) => {
+					this.manager.emit(
+						"Debug",
+						`[Failover] Failed to move player ${player.guild}: ${err instanceof Error ? err.message : String(err)} — will retry on reconnect`,
+					);
+				});
+		}
 	}
 
 	protected error(error: Error): void {
@@ -611,6 +710,25 @@ class StellaNode {
 				player.state = "CONNECTED";
 				player.voiceReady = true;
 				player.connected = data.state.connected;
+			}
+
+			// Restore persisted player state (autoplay, queue, filters, history)
+			const store = this.manager.getPlayerStateStore();
+			if (store) {
+				try {
+					const savedState = await store.getPlayerState(data.guildId);
+					if (savedState) {
+						player.restoreFromState(savedState);
+						this.manager.emit(
+							"Debug",
+							`[Node:${this.options.identifier}] Restored persisted state for guild ${data.guildId} (autoplay: ${savedState.isAutoplay})`,
+						);
+						// Clean up persisted state after successful restore
+						await store.deletePlayerState(data.guildId);
+					}
+				} catch {
+					// Ignore restore errors
+				}
 			}
 
 			player.position = data.state.position;
@@ -869,7 +987,11 @@ class StellaNode {
 		// Helper: filter out history + current/previous, score & rank, return best
 		const pickBestTransition = (tracks: Track[]): Track | undefined => {
 			const eligible = tracks.filter(
-				(t) => t.uri !== previousTrack.uri && t.uri !== track.uri && !historySet.has(t.uri),
+				(t) =>
+					t.uri !== previousTrack.uri &&
+					t.uri !== track.uri &&
+					!historySet.has(t.uri) &&
+					!historySet.has(`${t.title}::${t.author}`),
 			);
 			if (!eligible.length) return undefined;
 
@@ -888,12 +1010,15 @@ class StellaNode {
 			return pick?.track;
 		};
 
-		// Helper: add track to history (bounded ring buffer)
+		// Helper: add track to history (bounded ring buffer — dedup by URI and title+author)
 		const addToHistory = (t: Track): void => {
-			if (t.uri) {
-				player.autoplayHistory.push(t.uri);
+			const key = t.uri || `${t.title}::${t.author}`;
+			if (key && !historySet.has(key)) {
+				player.autoplayHistory.push(key);
+				historySet.add(key);
 				if (player.autoplayHistory.length > 50) {
-					player.autoplayHistory.splice(0, player.autoplayHistory.length - 50);
+					const removed = player.autoplayHistory.splice(0, player.autoplayHistory.length - 50);
+					for (const r of removed) historySet.delete(r);
 				}
 			}
 		};
@@ -915,7 +1040,13 @@ class StellaNode {
 		const commitTrack = (found: Track, strategy: string): void => {
 			addToHistory(found);
 			player.queue.add(found);
-			player.play();
+			player.play().catch((err) => {
+				this.manager.emit(
+					"Debug",
+					`[AutoMix] Failed to play (${strategy}): ${err instanceof Error ? err.message : String(err)}`,
+				);
+				player.playing = false;
+			});
 			this.manager.emit("Debug", `[AutoMix] Playing (${strategy}): "${found.title}" by "${found.author}"`);
 		};
 
@@ -960,10 +1091,21 @@ class StellaNode {
 						const candidates = playlistData.tracks.map((t) => TrackUtils.build(t, requester));
 						const picked = pickBestTransition(candidates);
 						if (picked) {
-							// Re-search on SoundCloud for a streamable version
+							// Try playing the Spotify rec directly first (if source supports it)
+							if (picked.track && picked.uri) {
+								commitTrack(picked, "Spotify rec (direct)");
+								return;
+							}
+							// Fallback: re-search on SoundCloud for a streamable version
 							const streamable = await tryMixSearch({ source: "soundcloud", query: `${picked.author} ${picked.title}` });
 							if (streamable) {
 								commitTrack(streamable, "Spotify rec → SoundCloud");
+								return;
+							}
+							// Fallback: try YouTube
+							const ytFallback = await tryMixSearch({ source: "youtube", query: `${picked.author} ${picked.title}` });
+							if (ytFallback) {
+								commitTrack(ytFallback, "Spotify rec → YouTube");
 								return;
 							}
 						}
@@ -1034,8 +1176,22 @@ class StellaNode {
 			previousTrack.uri?.includes(url),
 		);
 		if (hasYouTubeURL) {
-			const videoID = previousTrack.uri?.substring(previousTrack.uri.indexOf("=") + 1);
-			if (videoID) {
+			// Robust YouTube video ID extraction (handles /watch?v=ID, /shorts/ID, youtu.be/ID)
+			let videoID: string | null = null;
+			try {
+				const url = new URL(previousTrack.uri!);
+				if (url.hostname === "youtu.be") {
+					videoID = url.pathname.slice(1).split("/")[0] || null;
+				} else {
+					videoID = url.searchParams.get("v") ?? url.pathname.split("/").pop() ?? null;
+				}
+			} catch {
+				// Fallback regex for malformed URIs
+				const match = previousTrack.uri?.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+				videoID = match ? match[1] : null;
+			}
+
+			if (videoID && videoID.length >= 10) {
 				const randomIndex = Math.floor(Math.random() * 23) + 2;
 				const mixURI = `https://www.youtube.com/watch?v=${videoID}&list=RD${videoID}&index=${randomIndex}`;
 				const found = await tryMixSearch(mixURI);
@@ -1052,12 +1208,12 @@ class StellaNode {
 		this.manager.emit("QueueEnd", player, track, { type: "TrackEndEvent", reason: "finished" } as any);
 	}
 
-	private handleFailedTrack(player: StellaPlayer, track: Track, payload: TrackEndEvent): void {
+	private async handleFailedTrack(player: StellaPlayer, track: Track, payload: TrackEndEvent): Promise<void> {
 		player.queue.previous = player.queue.current;
 		player.queue.current = player.queue.shift() ?? null;
 
 		if (!player.queue.current) {
-			this.queueEnd(player, track, payload);
+			await this.queueEnd(player, track, payload);
 			return;
 		}
 
@@ -1065,7 +1221,7 @@ class StellaNode {
 		if (this.manager.options.autoPlay) player.play();
 	}
 
-	private handleRepeatedTrack(player: StellaPlayer, track: Track, payload: TrackEndEvent): void {
+	private async handleRepeatedTrack(player: StellaPlayer, track: Track, payload: TrackEndEvent): Promise<void> {
 		const { queue, trackRepeat, queueRepeat } = player;
 		const { autoPlay } = this.manager.options;
 
@@ -1081,7 +1237,7 @@ class StellaNode {
 		this.manager.emit("TrackEnd", player, track, payload);
 
 		if (payload.reason === "stopped" && !(queue.current = queue.shift() ?? null)) {
-			this.queueEnd(player, track, payload);
+			await this.queueEnd(player, track, payload);
 			return;
 		}
 
@@ -1125,6 +1281,20 @@ class StellaNode {
 
 	protected socketClosed(player: StellaPlayer, payload: WebSocketClosedEvent): void {
 		this.manager.emit("SocketClosed", player, payload);
+
+		// 4014 = Disconnected by Discord (bot was kicked/moved out of voice)
+		// 4006 = Session is no longer valid
+		const VOICE_FATAL_CODES = [4014, 4006];
+		if (VOICE_FATAL_CODES.includes(payload.code)) {
+			this.manager.emit(
+				"Debug",
+				`[Player:${player.guild}] Voice socket closed with code ${payload.code} (${payload.reason || "no reason"}) — cleaning up player`,
+			);
+			player.voiceReady = false;
+			player.connected = false;
+			player.playing = false;
+			player.state = "DISCONNECTED";
+		}
 	}
 }
 

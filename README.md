@@ -28,6 +28,11 @@
   - [Filters](#filters)
 - [Multi-Version Support (v3 + v4)](#multi-version-support-v3--v4)
 - [Session Persistence](#session-persistence)
+- [Player State Persistence](#player-state-persistence)
+- [Auto-Failover](#auto-failover)
+- [Inactivity Timeout](#inactivity-timeout)
+- [Queue Limits & Deduplication](#queue-limits--deduplication)
+- [Node Health Monitoring](#node-health-monitoring)
 - [Smart Autoplay](#smart-autoplay)
 - [Search with Fallback](#search-with-fallback)
 - [Audio Filters](#audio-filters)
@@ -47,9 +52,11 @@
 Unlike other Lavalink clients, StellaLib:
 
 - **Auto-detects** whether your Lavalink server is v3 or v4 and adapts automatically
-- **Persists sessions** across bot restarts so music keeps playing
+- **Persists sessions and player state** across bot restarts so music keeps playing — autoplay, queue, filters, and history all survive
 - **Has a smart autoplay engine** that picks the best next track based on listening history
-- **Handles failures gracefully** with reconnect backoff, rate limit retries, and search fallback
+- **Auto-failover** — when a node dies, players move to healthy nodes automatically
+- **Proactive health monitoring** — detects overloaded nodes and migrates players *before* they crash
+- **Handles failures gracefully** with fast first reconnect, exponential backoff, rate limit retries, and search fallback
 
 ## How it Works
 
@@ -97,7 +104,7 @@ StellaLib is composed of several core classes that work together:
 | **`StellaRest`** | HTTP client for Lavalink's REST API. Version-aware (v3 vs v4 endpoints), with rate limit retry, request deduplication, and timeout handling. |
 | **`StellaFilters`** | Manages audio filters and equalizer settings per player. Built-in presets for common effects. |
 | **`LRUCache`** | Bounded least-recently-used cache with TTL expiry for search results. Reduces redundant API calls. |
-| **`FileSessionStore`** | Persists Lavalink session IDs to a JSON file. Enables seamless resume after bot restarts. |
+| **`FileSessionStore`** | Persists Lavalink session IDs **and full player states** to a JSON file. Enables seamless resume after bot restarts — including autoplay, queue, and filters. |
 
 ### Project Structure
 
@@ -410,7 +417,8 @@ const manager = new StellaManager({
 1. On connect, Node loads saved session ID from the store
 2. Sends it as `Session-Id` (v4) or `Resume-Key` (v3) header
 3. Lavalink resumes the session — players keep their state
-4. On disconnect/shutdown, session ID is persisted to the store
+4. On disconnect/shutdown, session ID **and full player state** is persisted to the store
+5. On resume, autoplay state, queue, filters, history, and seed pool are all restored
 
 **Custom stores** (e.g., Redis, database):
 
@@ -424,6 +432,178 @@ const manager = new StellaManager({
   // ...
 });
 ```
+
+## Player State Persistence
+
+StellaLib v1.1.0+ persists **full player state** — not just session IDs — across bot restarts. This means autoplay, queue, filters, repeat modes, and listening history all survive a restart.
+
+```ts
+import { FileSessionStore } from "@stella_project/stellalib";
+
+// FileSessionStore automatically handles both session IDs and player states
+const manager = new StellaManager({
+  sessionStore: new FileSessionStore("./sessions.json"),
+  // Player state store is auto-detected from FileSessionStore
+  // Or provide a custom one:
+  // playerStateStore: myCustomStore,
+  // ...
+});
+```
+
+**What is persisted per player:**
+- Autoplay on/off state and bot user ID
+- Autoplay history (last 50 tracks) and seed pool
+- Queue (all tracks with encoded data)
+- Filter configuration and active preset flags
+- Repeat modes (track, queue, dynamic)
+- Volume, voice channel, text channel
+
+**Custom player state store** (e.g., Redis):
+
+```ts
+const manager = new StellaManager({
+  playerStateStore: {
+    async getPlayerState(guildId) { return JSON.parse(await redis.get(`player:${guildId}`)); },
+    async setPlayerState(guildId, state) { await redis.set(`player:${guildId}`, JSON.stringify(state)); },
+    async deletePlayerState(guildId) { await redis.del(`player:${guildId}`); },
+    async getAllPlayerStates() { /* return all states */ },
+  },
+  // ...
+});
+```
+
+## Auto-Failover
+
+When a Lavalink node goes down **mid-playback**, StellaLib **immediately** moves all playing/paused players to a healthy node — audio continues at the exact same position with typically <150ms gap:
+
+```
+                    Node A crashes! 💥
+
+  t=0ms    WebSocket close fires
+  t=2ms    attemptSeamlessFailover() starts
+  t=5ms    Healthy nodes sorted by penalty score
+  t=50ms   Voice state sent to Node B
+  t=100ms  Track + position + filters sent
+  t=150ms  Audio resumes on Node B ♪
+```
+
+```
+Node A (dies)              Node B (healthy)         Node C (healthy)
+  Player 1  ──────────────►  Player 1  ♪
+  Player 2  ──────────────►  Player 2  ♪           (load balanced)
+  Player 3  ────────────────────────────────────►  Player 3  ♪
+```
+
+### Three Layers of Protection
+
+| Layer | Trigger | Speed |
+|---|---|---|
+| **Seamless failover** | Node unexpectedly disconnects | Immediate (<150ms) |
+| **Health monitoring** | CPU/frame deficit exceeds threshold | Proactive (before crash) |
+| **Destroy failover** | Node explicitly removed from pool | Immediate |
+
+### PlayerFailover Event
+
+```ts
+manager.on("PlayerFailover", (player, oldNode, newNode) => {
+  console.log(`Player ${player.guild} moved: ${oldNode} → ${newNode}`);
+  // Optionally notify the guild
+});
+```
+
+- Players are distributed across healthy nodes by **penalty score** (not all dumped on one node)
+- If no healthy nodes exist, players wait for reconnect (fast 2s retry on first attempt)
+- See [docs/13-seamless-failover.md](docs/13-seamless-failover.md) for full architecture details
+
+## Inactivity Timeout
+
+Auto-disconnect the bot when it's alone in a voice channel:
+
+```ts
+const player = manager.create({
+  guild: guildId,
+  voiceChannel: voiceChannelId,
+  inactivityTimeout: 300000, // 5 minutes
+});
+
+// In your voiceStateUpdate handler:
+client.on("voiceStateUpdate", (oldState, newState) => {
+  const player = manager.get(oldState.guild.id);
+  if (!player) return;
+
+  const channel = oldState.guild.channels.cache.get(player.voiceChannel!);
+  const members = channel?.members?.filter((m) => !m.user.bot).size ?? 0;
+
+  if (members === 0) {
+    player.startInactivityTimer();  // Start countdown
+  } else {
+    player.stopInactivityTimer();   // Cancel — someone joined
+  }
+});
+```
+
+## Queue Limits & Deduplication
+
+### Max Queue Size
+
+Prevent memory abuse by limiting the queue:
+
+```ts
+const player = manager.create({
+  guild: guildId,
+  voiceChannel: voiceChannelId,
+  maxQueueSize: 500, // Max 500 tracks in queue
+});
+
+// Check before adding
+if (!player.canAddToQueue(tracks.length)) {
+  return message.reply(`Queue is full! Only ${player.queueSpaceRemaining} slots left.`);
+}
+player.queue.add(tracks); // Excess tracks are automatically truncated
+```
+
+### Track Deduplication
+
+Prevent the same song from being queued twice:
+
+```ts
+player.queue.noDuplicates = true;
+
+// Now queue.add() silently skips tracks that are already queued
+player.queue.add(track); // Added
+player.queue.add(track); // Silently skipped (same URI)
+
+// Check manually:
+if (player.queue.isDuplicate(track)) {
+  return message.reply("That track is already in the queue!");
+}
+```
+
+## Node Health Monitoring
+
+StellaLib can proactively monitor node health and migrate players **before** a node crashes:
+
+```ts
+const manager = new StellaManager({
+  nodeHealthThresholds: {
+    maxCpuLoad: 0.85,       // Migrate when CPU exceeds 85%
+    maxFrameDeficit: 300,   // Migrate when frame deficit exceeds 300
+    checkInterval: 30000,   // Check every 30 seconds
+  },
+  // ...
+});
+```
+
+```
+         Health Check (every 30s)
+               │
+    Node A: CPU 92% ──► OVERLOADED
+    Node B: CPU 40% ──► healthy
+               │
+    Migrate players A → B (preemptive)
+```
+
+This is **proactive** failover — it moves players before they experience audio issues, unlike the reactive auto-failover which only triggers when a node dies.
 
 ## Smart Autoplay
 
@@ -497,7 +677,8 @@ const result = await manager.search("natori セレナーデ", userId);
 | `PlayerMove` | `(player, oldChannel, newChannel)` | Bot moved to different voice channel |
 | `PlayerDisconnect` | `(player, oldChannel)` | Bot disconnected from voice |
 | `PlayerStateUpdate` | `(oldPlayer, newPlayer)` | Player state changed |
-| `SocketClosed` | `(player, payload)` | Lavalink WebSocket closed for player |
+| `PlayerFailover` | `(player, oldNode, newNode)` | Player seamlessly moved to a new node |
+| `SocketClosed` | `(player, payload)` | Discord voice WebSocket closed for player |
 | `Debug` | `(message)` | Debug log message |
 
 ## Configuration Reference
@@ -515,6 +696,12 @@ interface ManagerOptions {
   defaultSearchPlatform?: SearchPlatform;// Default search source
   searchFallback?: string[];             // Fallback platforms
   sessionStore?: SessionStore;           // Session persistence store
+  playerStateStore?: PlayerStateStore;   // Full player state persistence (auto-detected from sessionStore)
+  nodeHealthThresholds?: {               // Proactive node health monitoring
+    maxCpuLoad?: number;                 // Max CPU load (0-1), default: 0.9
+    maxFrameDeficit?: number;            // Max frame deficit, default: 500
+    checkInterval?: number;              // Check interval (ms), default: 60000
+  };
   caches?: {
     enabled: boolean;
     time: number;                        // TTL in ms
@@ -542,6 +729,22 @@ interface NodeOptions {
 }
 ```
 
+### Player Options
+
+```ts
+interface PlayerOptions {
+  guild: string;                 // Guild ID (required)
+  voiceChannel?: string;         // Voice channel ID
+  textChannel?: string;          // Text channel ID
+  node?: string;                 // Preferred node identifier
+  volume?: number;               // Initial volume (default: 11)
+  selfMute?: boolean;            // Self mute in voice
+  selfDeafen?: boolean;          // Self deafen in voice
+  inactivityTimeout?: number;    // Auto-disconnect when alone (ms, 0=disabled)
+  maxQueueSize?: number;         // Max queue tracks (0=unlimited)
+}
+```
+
 ## Requirements
 
 - **Node.js** >= 18.0.0
@@ -563,10 +766,24 @@ For detailed guides and API reference, see the [docs/](docs/) folder:
 - [Session Persistence](docs/09-session-persistence.md)
 - [Multi-Version Support](docs/10-multi-version.md)
 - [Autoplay Engine](docs/11-autoplay.md)
+- [Player State Persistence](docs/12-player-state-persistence.md)
 
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for a detailed list of changes per version.
+
+## Credits
+
+StellaLib stands on the shoulders of these amazing projects:
+
+| Project | Description | Link |
+|---|---|---|
+| **Lavalink** | The audio server that powers everything | [GitHub](https://github.com/lavalink-devs/Lavalink) · [Website](https://lavalink.dev/) |
+| **LithiumX** | Direct upstream — StellaLib is derived from LithiumX by Anantix Network (MIT) | [GitHub](https://github.com/anantix-network/LithiumX) |
+| **Erela.js** | Pioneered the Lavalink client pattern in the JS ecosystem — many design patterns originated here | [GitHub](https://github.com/MenuDocs/erela.js) |
+| **MagmaStream** | Inspiration for advanced features like improved node management and audio quality | [GitHub](https://github.com/Magmastream-NPM/magmastream) |
+
+Thank you to all the maintainers and contributors of these projects for making music bots possible.
 
 ## License
 

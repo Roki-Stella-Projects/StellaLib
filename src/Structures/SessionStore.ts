@@ -3,7 +3,7 @@
  * StellaLib — Copyright (c) 2026 AntonyZ, x2sadddDM, SynX, Astel (OSL-3.0)
  * See LICENSE and THIRD-PARTY-NOTICES.md for full license details.
  */
-import type { SessionStore } from "./Types";
+import type { SessionStore, PlayerStateStore, PlayerPersistData } from "./Types";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -19,8 +19,9 @@ import { dirname } from "node:path";
  * });
  * ```
  */
-export class FileSessionStore implements SessionStore {
+export class FileSessionStore implements SessionStore, PlayerStateStore {
 	private data: Record<string, string> = {};
+	private playerStates: Record<string, PlayerPersistData> = {};
 	private dirty = false;
 	private writeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -35,15 +36,26 @@ export class FileSessionStore implements SessionStore {
 		this.load();
 	}
 
-	/** Load sessions from disk. */
+	/** Load sessions from disk. Handles migration from old flat format. */
 	private load(): void {
 		try {
 			if (existsSync(this.filePath)) {
 				const raw = readFileSync(this.filePath, "utf-8");
-				this.data = JSON.parse(raw);
+				const parsed = JSON.parse(raw);
+
+				// New format: { sessions: {...}, players: {...} }
+				if (parsed.sessions && typeof parsed.sessions === "object") {
+					this.data = parsed.sessions;
+					this.playerStates = parsed.players ?? {};
+				} else {
+					// Old format: flat { nodeId: sessionId } — migrate
+					this.data = parsed;
+					this.playerStates = {};
+				}
 			}
 		} catch {
 			this.data = {};
+			this.playerStates = {};
 		}
 	}
 
@@ -66,7 +78,10 @@ export class FileSessionStore implements SessionStore {
 		try {
 			const dir = dirname(this.filePath);
 			if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-			writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), "utf-8");
+			writeFileSync(this.filePath, JSON.stringify({
+				sessions: this.data,
+				players: this.playerStates,
+			}, null, 2), "utf-8");
 			this.dirty = false;
 		} catch {
 			// Silently fail — best effort persistence
@@ -85,6 +100,26 @@ export class FileSessionStore implements SessionStore {
 	public delete(nodeId: string): void {
 		delete this.data[nodeId];
 		this.scheduleFlush();
+	}
+
+	// ── PlayerStateStore implementation ──────────────────────────────
+
+	public getPlayerState(guildId: string): PlayerPersistData | null {
+		return this.playerStates[guildId] ?? null;
+	}
+
+	public setPlayerState(guildId: string, state: PlayerPersistData): void {
+		this.playerStates[guildId] = state;
+		this.scheduleFlush();
+	}
+
+	public deletePlayerState(guildId: string): void {
+		delete this.playerStates[guildId];
+		this.scheduleFlush();
+	}
+
+	public getAllPlayerStates(): PlayerPersistData[] {
+		return Object.values(this.playerStates);
 	}
 
 	/** Flush and clean up timers. Call on shutdown. */

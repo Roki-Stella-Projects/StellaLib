@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/Roki-Stella-Projects/StellaLib/tree/main/docs
+    about: Check the docs before opening an issue — your question might already be answered.
+  - name: Discussions
+    url: https://github.com/Roki-Stella-Projects/StellaLib/discussions
+    about: Ask questions, share ideas, and connect with the community.

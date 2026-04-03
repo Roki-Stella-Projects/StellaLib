@@ -320,6 +320,42 @@ class Filters {
 	public getFilterStatus(filter: keyof AvailableFilters): boolean {
 		return this.filterStatus[filter];
 	}
+
+	/** Returns a copy of all filter statuses (for persistence). */
+	public getActiveFilters(): Record<string, boolean> {
+		return { ...this.filterStatus };
+	}
+
+	/**
+	 * Restores filter state from persisted data (used after bot restart).
+	 * Re-applies all active filters without sending to Lavalink yet.
+	 */
+	public restoreState(state: {
+		distortion: object | null;
+		equalizer: object[];
+		karaoke: object | null;
+		rotation: object | null;
+		timescale: object | null;
+		vibrato: object | null;
+		volume: number;
+		activeFilters: Record<string, boolean>;
+	}): void {
+		this.distortion = state.distortion as DistortionOptions | null;
+		this.equalizer = (state.equalizer ?? []) as Band[];
+		this.karaoke = state.karaoke as KaraokeOptions | null;
+		this.rotation = state.rotation as RotationOptions | null;
+		this.timescale = state.timescale as TimescaleOptions | null;
+		this.vibrato = state.vibrato as VibratoOptions | null;
+		this.volume = state.volume ?? 1.0;
+		if (state.activeFilters) {
+			this.filterStatus = { ...this.filterStatus, ...state.activeFilters };
+		}
+	}
+
+	/** Sends current filter state to Lavalink. Call after restoreState() to apply. */
+	public async applyFilters(): Promise<this> {
+		return this.updateFilters();
+	}
 }
 
 /** Options for adjusting the timescale of audio. */

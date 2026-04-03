@@ -42,6 +42,16 @@ export interface PlayerOptions {
 	selfMute?: boolean;
 	/** If the player should deaf itself. */
 	selfDeafen?: boolean;
+	/**
+	 * Auto-disconnect timeout in ms when the bot is alone in the voice channel.
+	 * Set to 0 to disable. Default: 0 (disabled).
+	 */
+	inactivityTimeout?: number;
+	/**
+	 * Maximum number of tracks allowed in the queue (excluding current track).
+	 * Set to 0 for unlimited. Default: 0 (unlimited).
+	 */
+	maxQueueSize?: number;
 }
 
 /** If track partials are set some of these will be `undefined` as they were removed. */
@@ -454,6 +464,59 @@ export interface PlayerStateSnapshot {
 	dynamicRepeat: boolean;
 }
 
+/** Minimal track data for persistence (avoids storing huge objects). */
+export interface TrackPersistData {
+	encoded: string;
+	title: string;
+	author: string;
+	uri: string;
+	duration: number;
+	sourceName: string;
+	identifier: string;
+	artworkUrl: string;
+	isrc: string;
+	isSeekable: boolean;
+	isStream: boolean;
+}
+
+/** Full player state for persistence across bot restarts (includes autoplay, queue, filters). */
+export interface PlayerPersistData {
+	guildId: string;
+	voiceChannelId: string | null;
+	textChannelId: string | null;
+	nodeIdentifier: string;
+	currentTrack: TrackPersistData | null;
+	position: number;
+	volume: number;
+	paused: boolean;
+	trackRepeat: boolean;
+	queueRepeat: boolean;
+	dynamicRepeat: boolean;
+	isAutoplay: boolean;
+	botUserId: string | null;
+	autoplayHistory: string[];
+	autoplaySeedPool: { title: string; author: string; uri: string; duration: number; sourceName: string }[];
+	queue: TrackPersistData[];
+	filters: {
+		distortion: object | null;
+		equalizer: object[];
+		karaoke: object | null;
+		rotation: object | null;
+		timescale: object | null;
+		vibrato: object | null;
+		volume: number;
+		activeFilters: Record<string, boolean>;
+	};
+}
+
+/** Interface for persisting full player state across bot restarts. */
+export interface PlayerStateStore {
+	getPlayerState(guildId: string): Promise<PlayerPersistData | null> | PlayerPersistData | null;
+	setPlayerState(guildId: string, state: PlayerPersistData): Promise<void> | void;
+	deletePlayerState(guildId: string): Promise<void> | void;
+	getAllPlayerStates(): Promise<PlayerPersistData[]> | PlayerPersistData[];
+}
+
 export interface ManagerOptions {
 	/** Use priority mode over least amount of player or load? */
 	usePriority?: boolean;
@@ -495,6 +558,23 @@ export interface ManagerOptions {
 	/** Session store for persisting session IDs across bot restarts. */
 	sessionStore?: SessionStore;
 	/**
+	 * Player state store for persisting full player state (autoplay, queue, filters)
+	 * across bot restarts. If using FileSessionStore, it implements this automatically.
+	 */
+	playerStateStore?: PlayerStateStore;
+	/**
+	 * Thresholds for proactive node health monitoring.
+	 * When a node exceeds these thresholds, players are preemptively migrated.
+	 */
+	nodeHealthThresholds?: {
+		/** Max CPU load (0-1) before migrating players. Default: 0.9 (90%) */
+		maxCpuLoad?: number;
+		/** Max frame deficit per 3000 frames before migrating. Default: 500 */
+		maxFrameDeficit?: number;
+		/** How often to check node health in ms. Default: 60000 (1 min) */
+		checkInterval?: number;
+	};
+	/**
 	 * Function to send data to the Discord websocket.
 	 * @param id Guild ID
 	 * @param payload The payload to send
@@ -523,5 +603,6 @@ export interface ManagerEvents {
 	TrackEnd: (player: any, track: Track, payload: TrackEndEvent) => void;
 	TrackStuck: (player: any, track: Track, payload: TrackStuckEvent) => void;
 	TrackError: (player: any, track: Track | UnresolvedTrack, payload: TrackExceptionEvent | unknown) => void;
+	PlayerFailover: (player: any, oldNode: string, newNode: string) => void;
 	Debug: (message: string) => void;
 }

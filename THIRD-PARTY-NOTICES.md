@@ -73,6 +73,34 @@ SOFTWARE.
 
 ---
 
+## Erela.js
+
+- **Project:** Erela.js
+- **Repository:** https://github.com/MenuDocs/erela.js
+- **License:** Apache-2.0
+- **Note:** Erela.js pioneered the Lavalink client pattern in the JavaScript ecosystem. Many design patterns used in LithiumX (and by extension StellaLib) — such as the Manager/Node/Player/Queue class hierarchy, the plugin system, and the event-driven architecture — originated from Erela.js. StellaLib does not contain direct code from Erela.js, but acknowledges its foundational influence on the Lavalink client ecosystem.
+
+---
+
+## MagmaStream
+
+- **Project:** MagmaStream
+- **Repository:** https://github.com/Magmastream-NPM/magmastream
+- **License:** ISC
+- **Note:** MagmaStream provided inspiration for advanced features in StellaLib, including improved node management strategies, penalty-based load balancing, and audio quality optimizations. StellaLib does not contain direct code from MagmaStream, but acknowledges its contributions to the Lavalink client ecosystem.
+
+---
+
+## Lavalink
+
+- **Project:** Lavalink
+- **Repository:** https://github.com/lavalink-devs/Lavalink
+- **Website:** https://lavalink.dev/
+- **License:** MIT License
+- **Note:** Lavalink is the audio server that StellaLib connects to. StellaLib implements the Lavalink client protocol (both v3 and v4) as documented in the Lavalink specification.
+
+---
+
 ## tiny-typed-emitter
 
 - **Repository:** https://github.com/binier/tiny-typed-emitter
