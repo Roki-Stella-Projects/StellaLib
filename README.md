@@ -1,44 +1,144 @@
-# StellaLib
+<p align="center">
+  <h1 align="center">StellaLib</h1>
+  <p align="center">A powerful Lavalink v3 + v4 client for TypeScript — with auto version detection, session persistence, smart autoplay, and graceful shutdown.</p>
+</p>
 
-A powerful, modern Lavalink client library for TypeScript/JavaScript with auto version detection (v3 + v4), session persistence, smart autoplay, and graceful shutdown.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@stella_project/stellalib"><img src="https://img.shields.io/npm/v/@stella_project/stellalib.svg?style=flat-square&color=blue" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@stella_project/stellalib"><img src="https://img.shields.io/npm/dm/@stella_project/stellalib.svg?style=flat-square" alt="npm downloads" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-OSL--3.0-blue.svg?style=flat-square" alt="License" /></a>
+  <a href="https://github.com/Roki-Stella-Projects/StellaLib"><img src="https://img.shields.io/github/stars/Roki-Stella-Projects/StellaLib?style=flat-square" alt="GitHub stars" /></a>
+</p>
 
-[![npm version](https://img.shields.io/npm/v/stellalib.svg)](https://www.npmjs.com/package/stellalib)
-[![License: OSL-3.0](https://img.shields.io/badge/License-OSL--3.0-blue.svg)](LICENSE)
+---
 
-## Features
+## Table of Contents
 
-- **Lavalink v3 + v4** — Auto-detects server version and adapts protocol automatically
-- **Session Persistence** — Save/restore session IDs across bot restarts with `FileSessionStore`
-- **Smart Autoplay** — Auto-mix engine with transition scoring, multi-seed recommendations, and history tracking
-- **Graceful Shutdown** — Persist sessions, close nodes cleanly, and flush stores on SIGINT/SIGTERM
-- **Voice Readiness** — Promise-based voice connection waiting before playback
-- **Audio Filters** — Built-in presets: bassboost, nightcore, vaporwave, 8D, slowmo, and more
-- **Search Caching** — LRU cache with TTL for search results to reduce API calls
-- **Search Fallback** — Automatic fallback across platforms (Spotify → SoundCloud → YouTube)
-- **Node Selection** — Penalty-based, least-load, least-players, or priority-based node selection
-- **Heartbeat** — WebSocket ping/pong to detect dead connections and auto-reconnect
-- **REST Resilience** — Auto-retry on 429 rate limits, GET deduplication, request timeouts
-- **Reconnect** — Exponential backoff with jitter to prevent thundering herd
-- **Plugin System** — Extensible via plugins
-- **Typed Events** — Fully typed event emitter for all manager events
-- **Strict TypeScript** — Written with strict TypeScript
+- [What is StellaLib?](#what-is-stellalib)
+- [How it Works](#how-it-works)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Core Concepts](#core-concepts)
+  - [Manager](#manager)
+  - [Node](#node)
+  - [Player](#player)
+  - [Queue](#queue)
+  - [Rest](#rest)
+  - [Filters](#filters)
+- [Multi-Version Support (v3 + v4)](#multi-version-support-v3--v4)
+- [Session Persistence](#session-persistence)
+- [Smart Autoplay](#smart-autoplay)
+- [Search with Fallback](#search-with-fallback)
+- [Audio Filters](#audio-filters)
+- [Events Reference](#events-reference)
+- [Configuration Reference](#configuration-reference)
+- [Requirements](#requirements)
+- [Documentation](#documentation)
+- [Changelog](#changelog)
+- [License](#license)
+
+---
+
+## What is StellaLib?
+
+**StellaLib** is a TypeScript client library that connects your Discord bot to [Lavalink](https://github.com/lavalink-devs/Lavalink) — a standalone audio server that handles music playback, search, and streaming. StellaLib manages the entire lifecycle: connecting to Lavalink nodes, creating guild-level players, searching tracks, controlling playback, and handling events.
+
+Unlike other Lavalink clients, StellaLib:
+
+- **Auto-detects** whether your Lavalink server is v3 or v4 and adapts automatically
+- **Persists sessions** across bot restarts so music keeps playing
+- **Has a smart autoplay engine** that picks the best next track based on listening history
+- **Handles failures gracefully** with reconnect backoff, rate limit retries, and search fallback
+
+## How it Works
+
+```
+┌──────────────┐     raw voice events     ┌──────────────────┐     WebSocket/REST     ┌──────────┐
+│  Discord.js  │ ──────────────────────► │   StellaManager   │ ◄──────────────────► │ Lavalink │
+│   (your bot) │ ◄────── send payloads ── │                    │                       │  Server  │
+└──────────────┘                          └──────────────────┘                       └──────────┘
+                                                  │
+                                    ┌─────────────┼─────────────┐
+                                    ▼             ▼             ▼
+                              ┌──────────┐ ┌──────────┐ ┌──────────┐
+                              │  Node 1  │ │  Node 2  │ │  Node N  │
+                              │ (v4 auto)│ │ (v3 auto)│ │          │
+                              └──────────┘ └──────────┘ └──────────┘
+                                    │
+                              ┌─────┼─────┐
+                              ▼     ▼     ▼
+                          ┌────────┐ ┌────────┐
+                          │Player A│ │Player B│  (one per guild)
+                          │ Queue  │ │ Queue  │
+                          │Filters │ │Filters │
+                          └────────┘ └────────┘
+```
+
+**Flow:**
+
+1. Your bot receives raw Discord voice events and forwards them to `StellaManager`
+2. The Manager routes voice data to the correct `Node` (Lavalink server connection)
+3. Each Node auto-detects its Lavalink version (v3 or v4) and adapts its protocol
+4. `Player` instances (one per guild) handle playback, queue, volume, and filters
+5. The Node's `Rest` client handles track loading, player updates, and session management
+6. Events flow back from Lavalink → Node → Manager → your bot's event handlers
+
+## Architecture
+
+StellaLib is composed of several core classes that work together:
+
+| Class | What it does |
+|---|---|
+| **`StellaManager`** | The entry point. Manages all nodes and players, handles search, voice state updates, caching, and shutdown. You create one Manager per bot. |
+| **`StellaNode`** | Represents a connection to a single Lavalink server. Handles WebSocket connection, heartbeat, reconnect, version detection, session resume, and autoplay logic. |
+| **`StellaPlayer`** | One player per Discord guild. Controls playback (`play`, `pause`, `stop`, `seek`), manages the queue, applies filters, and handles voice readiness. |
+| **`StellaQueue`** | Extends `Array` with music-specific methods: `add()`, `remove()`, `clear()`, `shuffle()`, repeat modes, and `current`/`previous` track tracking. |
+| **`StellaRest`** | HTTP client for Lavalink's REST API. Version-aware (v3 vs v4 endpoints), with rate limit retry, request deduplication, and timeout handling. |
+| **`StellaFilters`** | Manages audio filters and equalizer settings per player. Built-in presets for common effects. |
+| **`LRUCache`** | Bounded least-recently-used cache with TTL expiry for search results. Reduces redundant API calls. |
+| **`FileSessionStore`** | Persists Lavalink session IDs to a JSON file. Enables seamless resume after bot restarts. |
+
+### Project Structure
+
+```
+src/
+  Structures/
+    Manager.ts      — Main hub: nodes, players, search, voice, cache, shutdown
+    Node.ts         — Lavalink node: WS, heartbeat, reconnect, version detect, autoplay
+    Player.ts       — Guild player: playback, queue, voice ready, filters, move node
+    Queue.ts        — Queue: add/remove/shuffle, repeat modes, current/previous
+    Rest.ts         — REST client: version-aware endpoints, retry, dedup, timeout
+    Filters.ts      — Audio filter management and presets
+    LRUCache.ts     — Bounded LRU cache with TTL and memory estimation
+    SessionStore.ts — FileSessionStore for session persistence
+    Types.ts        — All TypeScript interfaces, types, and event definitions
+    Utils.ts        — TrackUtils (build/validate tracks), Structure, Plugin system
+  Utils/
+    FiltersEqualizers.ts — Equalizer band presets for each filter
+    ManagerCheck.ts      — Manager option validation
+    NodeCheck.ts         — Node option validation
+    PlayerCheck.ts       — Player option validation
+  index.ts               — Re-exports everything
+```
 
 ## Installation
 
 ```bash
-npm install stellalib
+npm install @stella_project/stellalib
 # or
-yarn add stellalib
+yarn add @stella_project/stellalib
 # or
-bun add stellalib
+bun add @stella_project/stellalib
 ```
 
 ## Quick Start
 
 ```ts
 import { Client, GatewayIntentBits } from "discord.js";
-import { StellaManager, FileSessionStore } from "stellalib";
+import { StellaManager, FileSessionStore } from "@stella_project/stellalib";
 
+// 1. Create your Discord client
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -48,38 +148,73 @@ const client = new Client({
   ],
 });
 
+// 2. Create the StellaLib manager
 const manager = new StellaManager({
   nodes: [
     {
-      identifier: "main",
-      host: "localhost",
-      port: 2333,
-      password: "youshallnotpass",
-      resumeStatus: true,
-      resumeTimeout: 120,
-      heartbeatInterval: 30000,
+      identifier: "main",        // Unique name for this node
+      host: "localhost",          // Lavalink server host
+      port: 2333,                // Lavalink server port
+      password: "youshallnotpass",// Lavalink password
+      resumeStatus: true,        // Enable session resuming
+      resumeTimeout: 120,        // Seconds Lavalink waits for reconnect
+      heartbeatInterval: 30000,  // Ping interval in ms
     },
   ],
-  autoPlay: true,
-  defaultSearchPlatform: "spotify",
-  searchFallback: ["soundcloud", "youtube music", "youtube"],
-  sessionStore: new FileSessionStore("./sessions.json"),
-  caches: { enabled: true, time: 60000, maxSize: 200 },
+  autoPlay: true,                              // Enable autoplay when queue ends
+  defaultSearchPlatform: "spotify",            // Default search source
+  searchFallback: ["soundcloud", "youtube"],   // Fallback if primary fails
+  sessionStore: new FileSessionStore("./sessions.json"), // Persist sessions
+  caches: { enabled: true, time: 60000, maxSize: 200 }, // Search cache
   send(id, payload) {
+    // Required: how to send voice payloads to Discord
     const guild = client.guilds.cache.get(id);
     if (guild) guild.shard.send(payload);
   },
 });
 
-// Forward raw Discord events to StellaLib
+// 3. Forward raw Discord events to StellaLib (required for voice)
 client.on("raw", (d) => manager.updateVoiceState(d));
 
+// 4. Initialize manager when bot is ready
 client.on("ready", () => {
   console.log(`Bot ready as ${client.user?.tag}`);
   manager.init(client.user!.id);
 });
 
-// Graceful shutdown
+// 5. Handle events
+manager.on("NodeConnect", (node) => {
+  console.log(`Connected to ${node.options.identifier} (Lavalink v${node.version})`);
+});
+
+manager.on("TrackStart", (player, track) => {
+  console.log(`Now playing: ${track.title}`);
+});
+
+// 6. Play music (example in a command handler)
+async function play(guildId: string, voiceChannelId: string, query: string) {
+  // Create or get player
+  let player = manager.players.get(guildId);
+  if (!player) {
+    player = manager.create({
+      guild: guildId,
+      voiceChannel: voiceChannelId,
+      textChannel: "TEXT_CHANNEL_ID",
+      volume: 50,
+      selfDeafen: true,
+    });
+    player.connect();
+  }
+
+  // Search and queue
+  const res = await manager.search(query, "USER_ID");
+  if (res.tracks.length) {
+    player.queue.add(res.tracks[0]);
+    if (!player.playing) player.play();
+  }
+}
+
+// 7. Graceful shutdown
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
     await manager.shutdown();
@@ -87,73 +222,230 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-// Play a track
-manager.on("NodeConnect", async () => {
-  const player = manager.create({
-    guild: "GUILD_ID",
-    voiceChannel: "VOICE_CHANNEL_ID",
-    textChannel: "TEXT_CHANNEL_ID",
-  });
-  player.connect();
+client.login("YOUR_BOT_TOKEN");
+```
 
-  const res = await manager.search("never gonna give you up");
-  if (res.tracks.length) {
-    player.queue.add(res.tracks[0]);
-    player.play();
-  }
+## Core Concepts
+
+### Manager
+
+`StellaManager` is the central hub. You create **one instance** and it manages everything.
+
+```ts
+const manager = new StellaManager({
+  nodes: [...],          // Array of Lavalink node configs
+  send: (id, payload) => { ... }, // How to send to Discord gateway
+  autoPlay: true,        // Auto-play next track when queue ends
+  defaultSearchPlatform: "spotify",
+  searchFallback: ["soundcloud", "youtube music"],
+  sessionStore: new FileSessionStore("./sessions.json"),
+  caches: { enabled: true, time: 60000, maxSize: 200 },
+  clientName: "StellaLib",
+  shards: 1,
 });
 
-client.login("YOUR_BOT_TOKEN");
+// Initialize after Discord client is ready
+manager.init(client.user!.id);
+```
+
+**Key methods:**
+- `manager.init(clientId)` — Connect all nodes
+- `manager.create(options)` — Create a player for a guild
+- `manager.get(guildId)` — Get existing player
+- `manager.search(query, requester?)` — Search tracks with fallback
+- `manager.updateVoiceState(data)` — Forward raw Discord voice events
+- `manager.shutdown()` — Gracefully close everything
+- `manager.getStats()` — Get node/player/cache statistics
+
+### Node
+
+`StellaNode` represents a single Lavalink server connection. Nodes are created automatically from the `nodes` config.
+
+**What it does automatically:**
+- Detects Lavalink version (v3 or v4) before connecting
+- Establishes WebSocket with the correct URL and headers
+- Sends heartbeat pings to detect dead connections
+- Reconnects with exponential backoff + jitter on disconnect
+- Configures session resuming (v3: WS op, v4: REST PATCH)
+- Syncs player state after resume (v4 only)
+- Handles autoplay logic when queue ends
+
+**Properties:**
+- `node.version` — Detected Lavalink version (`3` or `4`)
+- `node.connected` — Whether WebSocket is open
+- `node.stats` — CPU, memory, players, uptime stats
+- `node.info` — Cached Lavalink server info (plugins, sources)
+- `node.penalties` — Calculated penalty score for load balancing
+
+### Player
+
+`StellaPlayer` controls playback for **one Discord guild**. Created via `manager.create()`.
+
+```ts
+const player = manager.create({
+  guild: "GUILD_ID",
+  voiceChannel: "VOICE_CHANNEL_ID",
+  textChannel: "TEXT_CHANNEL_ID",
+  volume: 50,
+  selfDeafen: true,
+});
+
+player.connect();                    // Join voice channel
+player.play();                       // Play first track in queue
+player.pause(true);                  // Pause
+player.pause(false);                 // Resume
+player.stop();                       // Stop current track (plays next)
+player.seek(30000);                  // Seek to 30 seconds
+player.setVolume(80);                // Set volume (0-100)
+player.setTrackRepeat(true);         // Repeat current track
+player.setQueueRepeat(true);         // Repeat entire queue
+player.setAutoplay(true, botUser);   // Enable smart autoplay
+player.moveNode("other-node");       // Move to another Lavalink node
+player.destroy();                    // Leave channel and clean up
+```
+
+### Queue
+
+`StellaQueue` extends JavaScript's `Array` with music-specific helpers:
+
+```ts
+player.queue.add(track);            // Add track(s) to end
+player.queue.add([track1, track2]); // Add multiple
+player.queue.remove(0);             // Remove by index
+player.queue.clear();               // Clear all queued tracks
+player.queue.shuffle();             // Randomize order
+player.queue.current;               // Currently playing track
+player.queue.previous;              // Previously played track
+player.queue.totalSize;             // current + queued count
+player.queue.size;                  // Queued count (excluding current)
+```
+
+### Rest
+
+`StellaRest` handles all HTTP communication with Lavalink. It's version-aware — the same method call works for both v3 and v4.
+
+| Method | v3 behavior | v4 behavior |
+|---|---|---|
+| `loadTracks(id)` | `GET /loadtracks` → normalized | `GET /v4/loadtracks` |
+| `updatePlayer(opts)` | WS ops (`play`, `pause`, etc.) | `PATCH /v4/sessions/.../players/...` |
+| `destroyPlayer(id)` | WS `destroy` op | `DELETE /v4/sessions/.../players/...` |
+| `configureResume(t)` | WS `configureResuming` op | `PATCH /v4/sessions/...` |
+| `getInfo()` | `GET /version` | `GET /v4/info` |
+| `decodeTracks(arr)` | `POST /decodetracks` | `POST /v4/decodetracks` |
+
+**Built-in resilience:**
+- Auto-retry on 429 rate limits (up to 3 retries with `Retry-After`)
+- GET request deduplication (concurrent identical GETs share one request)
+- Configurable request timeout
+- Request/failure counters
+
+### Filters
+
+Built-in audio filter presets:
+
+```ts
+await player.filters.setFilter("bassboost", true);
+await player.filters.setFilter("nightcore", true);
+await player.filters.setFilter("vaporwave", true);
+await player.filters.setFilter("eightD", true);
+await player.filters.setFilter("slowmo", true);
+await player.filters.setFilter("soft", true);
+await player.filters.setFilter("trebleBass", true);
+await player.filters.setFilter("tv", true);
+await player.filters.setFilter("distort", true);
+
+await player.filters.clearFilters(); // Remove all
+```
+
+Each preset applies specific equalizer bands, timescale, rotation, or other Lavalink audio parameters.
+
+## Multi-Version Support (v3 + v4)
+
+StellaLib **automatically detects** your Lavalink server version before connecting. No configuration needed.
+
+**How detection works:**
+1. Before WebSocket connect, the Node sends `GET /v4/info` to the server
+2. If it responds `200 OK` → **Lavalink v4** detected (server info is cached)
+3. If it fails, tries `GET /version` → **Lavalink v3** detected
+4. Falls back to v4 if both fail
+
+**What adapts automatically:**
+
+| Aspect | Lavalink v3 | Lavalink v4 |
+|---|---|---|
+| **WebSocket URL** | `ws://host:port` | `ws://host:port/v4/websocket` |
+| **Player control** | WebSocket ops (`play`, `stop`, `pause`, `seek`, `volume`, `filters`) | REST `PATCH` |
+| **Session resume** | `Resume-Key` header + WS `configureResuming` | `Session-Id` header + REST `PATCH` |
+| **Track loading** | `/loadtracks` (response normalized to v4 format) | `/v4/loadtracks` |
+| **Server info** | `/version` (returns version string) | `/v4/info` (returns full info JSON) |
+| **Player sync** | Not available (v3 limitation) | Full player state sync on resume |
+| **Track data** | `track` field → mapped to `encoded` | `encoded` field |
+| **Load types** | `TRACK_LOADED` → `track`, `SEARCH_RESULT` → `search`, etc. | Already v4 format |
+
+```ts
+manager.on("NodeConnect", (node) => {
+  console.log(`Lavalink v${node.version}`); // 3 or 4
+});
 ```
 
 ## Session Persistence
 
-StellaLib can persist Lavalink session IDs across bot restarts, so players keep playing without interruption:
+StellaLib persists session IDs so music **keeps playing** after bot restarts.
 
 ```ts
-import { FileSessionStore } from "stellalib";
+import { FileSessionStore } from "@stella_project/stellalib";
 
 const manager = new StellaManager({
   sessionStore: new FileSessionStore("./sessions.json"),
   nodes: [{
-    resumeStatus: true,
-    resumeTimeout: 120, // seconds Lavalink waits for reconnect
+    resumeStatus: true,    // Tell Lavalink to hold the session
+    resumeTimeout: 120,    // Seconds to wait before destroying session
     // ...
   }],
   // ...
 });
-
-// On shutdown, sessions are saved automatically
-await manager.shutdown();
 ```
 
-You can also implement your own store (e.g., Redis) by implementing the `SessionStore` interface:
+**How it works:**
+1. On connect, Node loads saved session ID from the store
+2. Sends it as `Session-Id` (v4) or `Resume-Key` (v3) header
+3. Lavalink resumes the session — players keep their state
+4. On disconnect/shutdown, session ID is persisted to the store
+
+**Custom stores** (e.g., Redis, database):
 
 ```ts
-interface SessionStore {
-  get(nodeId: string): Promise<string | null> | string | null;
-  set(nodeId: string, sessionId: string): Promise<void> | void;
-  delete(nodeId: string): Promise<void> | void;
-}
+const manager = new StellaManager({
+  sessionStore: {
+    async get(nodeId) { return await redis.get(`session:${nodeId}`); },
+    async set(nodeId, sessionId) { await redis.set(`session:${nodeId}`, sessionId); },
+    async delete(nodeId) { await redis.del(`session:${nodeId}`); },
+  },
+  // ...
+});
 ```
 
 ## Smart Autoplay
 
-When the queue ends and autoplay is enabled, StellaLib's auto-mix engine finds the best next track:
+When the queue ends and autoplay is enabled, StellaLib's auto-mix engine picks the best next track.
 
 ```ts
-// Enable autoplay for a player
-player.setAutoplay(true, { id: user.id, tag: user.tag });
+player.setAutoplay(true, client.user);
 ```
 
-The engine scores candidates based on:
-- **Duration similarity** — Prefer tracks close in length to recent plays
-- **Author/title overlap** — Prioritize same artist or related keywords
-- **Source consistency** — Stay on the same platform when possible
-- **Diversity** — Avoid repeating the same artist too many times
-- **History tracking** — Never replay recently heard tracks (last 50)
+**How the engine works:**
 
-Uses multi-seed context from the last 5 tracks for Spotify recommendations, theme keyword extraction, and cross-artist transitions.
+1. **Seed collection** — Gathers the last 5 played tracks as context seeds
+2. **Source detection** — Identifies if the listener was on Spotify, YouTube, or SoundCloud
+3. **Recommendation fetch** — Uses Spotify `sprec:` (seed artists + seed tracks) or YouTube Mix
+4. **Candidate scoring** — Each candidate is scored on:
+   - Duration similarity to recent tracks
+   - Author/title keyword overlap
+   - Remix/cover penalty (avoids non-originals)
+   - History check (never replays last 50 tracks)
+5. **Best transition** — Picks the highest-scoring candidate
+6. **Cross-platform mirror** — If needed, re-searches on SoundCloud/YouTube for a streamable version
+7. **Fallback chain** — If recommendations fail, tries theme-based search, then random from same artist
 
 ## Search with Fallback
 
@@ -164,107 +456,117 @@ const manager = new StellaManager({
   // ...
 });
 
-// If Spotify returns empty, automatically tries SoundCloud, then YouTube Music, then YouTube
-const result = await manager.search("natori セレナーデ");
+// Searches Spotify first. If empty, tries SoundCloud, then YouTube Music, then YouTube.
+const result = await manager.search("natori セレナーデ", userId);
 ```
+
+**Supported platforms:** `spotify`, `soundcloud`, `youtube`, `youtube music`, `deezer`, `tidal`, `applemusic`, `bandcamp`, `jiosaavn`
 
 ## Audio Filters
 
-```ts
-// Toggle filters
-await player.filters.setFilter("nightcore", true);
-await player.filters.setFilter("bassboost", true);
-await player.filters.setFilter("vaporwave", true);
-await player.filters.setFilter("eightD", true);
+| Filter | Effect |
+|---|---|
+| `bassboost` | Boosts low frequencies |
+| `nightcore` | Speeds up + higher pitch |
+| `vaporwave` | Slows down + lower pitch |
+| `eightD` | Rotating stereo panning |
+| `slowmo` | Slower playback speed |
+| `soft` | Reduces harsh frequencies |
+| `trebleBass` | Boosts both high and low bands |
+| `tv` | Tinny speaker simulation |
+| `distort` | Audio distortion effect |
 
-// Clear all filters
-await player.filters.clearFilters();
-```
+## Events Reference
 
-Available: `bassboost`, `nightcore`, `vaporwave`, `eightD`, `slowmo`, `soft`, `trebleBass`, `tv`, `distort`
-
-## Manager Stats
-
-```ts
-const stats = manager.getStats();
-// { nodes, players, playingPlayers, cacheSize, cacheMemoryEstimate }
-```
-
-## Events
-
-```ts
-manager.on("NodeConnect", (node) => { });
-manager.on("NodeDisconnect", (node, reason) => { });
-manager.on("NodeError", (node, error) => { });
-manager.on("NodeReconnect", (node) => { });
-manager.on("NodeRaw", (payload) => { });
-manager.on("TrackStart", (player, track, payload) => { });
-manager.on("TrackEnd", (player, track, payload) => { });
-manager.on("TrackStuck", (player, track, payload) => { });
-manager.on("TrackError", (player, track, payload) => { });
-manager.on("QueueEnd", (player, track, payload) => { });
-manager.on("SocketClosed", (player, payload) => { });
-manager.on("PlayerCreate", (player) => { });
-manager.on("PlayerDestroy", (player) => { });
-manager.on("PlayerMove", (player, oldChannel, newChannel) => { });
-manager.on("PlayerDisconnect", (player, oldChannel) => { });
-manager.on("PlayerStateUpdate", (oldPlayer, newPlayer) => { });
-manager.on("Debug", (message) => { });
-```
-
-## Project Structure
-
-```
-src/
-  Structures/
-    Manager.ts      — Main hub: manages nodes, players, search, voice updates
-    Node.ts         — Lavalink node: WebSocket, reconnect, session resume, autoplay
-    Player.ts       — Guild player: playback, queue, voice readiness, filters
-    Queue.ts        — Queue: extends Array with add/remove/shuffle
-    Rest.ts         — REST client with retry, timeout, and deduplication
-    Filters.ts      — Audio filters and presets
-    LRUCache.ts     — Bounded LRU cache with TTL
-    SessionStore.ts — FileSessionStore for session persistence
-    Types.ts        — All TypeScript interfaces and types
-    Utils.ts        — TrackUtils, Structure, Plugin helpers
-  Utils/
-    FiltersEqualizers.ts — Equalizer band presets
-    ManagerCheck.ts      — Manager option validation
-    NodeCheck.ts         — Node option validation
-    PlayerCheck.ts       — Player option validation
-  index.ts               — Re-exports everything
-```
-
-## Multi-Version Support
-
-StellaLib auto-detects your Lavalink server version on connect and adapts:
-
-| Feature | Lavalink v3 | Lavalink v4 |
+| Event | Parameters | Description |
 |---|---|---|
-| **WebSocket URL** | `ws://host:port` | `ws://host:port/v4/websocket` |
-| **Player ops** | WebSocket ops (`play`, `stop`, `pause`, etc.) | REST PATCH |
-| **Session resume** | `Resume-Key` header + WS `configureResuming` | `Session-Id` header + REST PATCH |
-| **Load tracks** | `/loadtracks` (normalized to v4 format) | `/v4/loadtracks` |
-| **Server info** | `/version` | `/v4/info` |
-| **Player sync** | Not available | Full player state sync |
+| `NodeCreate` | `(node)` | Node instance created |
+| `NodeConnect` | `(node)` | WebSocket connection established |
+| `NodeReconnect` | `(node)` | Attempting reconnection |
+| `NodeDisconnect` | `(node, reason)` | WebSocket disconnected |
+| `NodeDestroy` | `(node)` | Node destroyed |
+| `NodeError` | `(node, error)` | Error on node |
+| `NodeRaw` | `(payload)` | Raw WebSocket message |
+| `TrackStart` | `(player, track, payload)` | Track started playing |
+| `TrackEnd` | `(player, track, payload)` | Track finished |
+| `TrackStuck` | `(player, track, payload)` | Track got stuck |
+| `TrackError` | `(player, track, payload)` | Track playback error |
+| `QueueEnd` | `(player, track, payload)` | Queue finished (all tracks played) |
+| `PlayerCreate` | `(player)` | Player created for a guild |
+| `PlayerDestroy` | `(player)` | Player destroyed |
+| `PlayerMove` | `(player, oldChannel, newChannel)` | Bot moved to different voice channel |
+| `PlayerDisconnect` | `(player, oldChannel)` | Bot disconnected from voice |
+| `PlayerStateUpdate` | `(oldPlayer, newPlayer)` | Player state changed |
+| `SocketClosed` | `(player, payload)` | Lavalink WebSocket closed for player |
+| `Debug` | `(message)` | Debug log message |
+
+## Configuration Reference
+
+### Manager Options
 
 ```ts
-// No configuration needed — version is auto-detected
-const manager = new StellaManager({
-  nodes: [{ host: "my-v3-server.com", port: 2333 }],
-  // ...
-});
+interface ManagerOptions {
+  nodes: NodeOptions[];                  // Lavalink server configs (required)
+  send: (id: string, payload: Payload) => void; // Discord gateway send (required)
+  clientId?: string;                     // Bot user ID (set by init())
+  clientName?: string;                   // Client identifier sent to Lavalink
+  shards?: number;                       // Shard count
+  autoPlay?: boolean;                    // Enable autoplay on queue end
+  defaultSearchPlatform?: SearchPlatform;// Default search source
+  searchFallback?: string[];             // Fallback platforms
+  sessionStore?: SessionStore;           // Session persistence store
+  caches?: {
+    enabled: boolean;
+    time: number;                        // TTL in ms
+    maxSize: number;                     // Max cached entries
+  };
+  plugins?: Plugin[];                    // Custom plugins
+}
+```
 
-// Check detected version after connect
-manager.on("NodeConnect", (node) => {
-  console.log(`Connected to Lavalink v${node.version}`); // 3 or 4
-});
+### Node Options
+
+```ts
+interface NodeOptions {
+  host: string;              // Lavalink host
+  port: number;              // Lavalink port
+  password: string;          // Lavalink password
+  identifier?: string;       // Unique node name
+  secure?: boolean;          // Use wss:// and https://
+  retryAmount?: number;      // Max reconnect attempts
+  retryDelay?: number;       // Base delay between retries (ms)
+  requestTimeout?: number;   // REST request timeout (ms)
+  resumeStatus?: boolean;    // Enable session resuming
+  resumeTimeout?: number;    // Seconds Lavalink holds session
+  heartbeatInterval?: number;// WebSocket ping interval (ms)
+}
 ```
 
 ## Requirements
 
 - **Node.js** >= 18.0.0
 - **Lavalink** v3.x or v4.x
+- **Discord.js** v14+ (or any library that exposes raw gateway events)
+
+## Documentation
+
+For detailed guides and API reference, see the [docs/](docs/) folder:
+
+- [Getting Started](docs/01-getting-started.md)
+- [Architecture](docs/02-architecture.md)
+- [Manager](docs/03-manager.md)
+- [Node](docs/04-node.md)
+- [Player](docs/05-player.md)
+- [Queue](docs/06-queue.md)
+- [Events](docs/07-events.md)
+- [Filters](docs/08-filters.md)
+- [Session Persistence](docs/09-session-persistence.md)
+- [Multi-Version Support](docs/10-multi-version.md)
+- [Autoplay Engine](docs/11-autoplay.md)
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a detailed list of changes per version.
 
 ## License
 
