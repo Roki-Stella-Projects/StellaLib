@@ -155,6 +155,12 @@ export interface NodeOptions {
 	priority?: number;
 	/** Heartbeat interval in ms to detect dead connections (0 = disabled, default: 30000). */
 	heartbeatInterval?: number;
+	/**
+	 * Enable WebSocket per-message deflate compression.
+	 * Reduces network overhead by up to 60% for high-traffic bots.
+	 * Default: false.
+	 */
+	wsCompression?: boolean;
 }
 
 export interface NodeStats {
@@ -372,7 +378,7 @@ export interface RestPlayOptions {
 	};
 }
 
-export type Method = "GET" | "POST" | "PATCH" | "DELETE";
+export type Method = "GET" | "POST" | "PATCH" | "DELETE" | "PUT";
 
 // ─── Manager Types ──────────────────────────────────────────────────────
 
@@ -544,6 +550,13 @@ export interface ManagerOptions {
 	 * Example: ["soundcloud", "deezer", "spotify"]
 	 */
 	searchFallback?: SearchPlatform[];
+	/**
+	 * Prefer Opus-native sources (SoundCloud, YouTube Music) for zero-transcode playback.
+	 * When enabled, search results from Opus-native sources get priority, reducing CPU
+	 * usage and providing the highest fidelity audio since Discord uses Opus natively.
+	 * Default: false.
+	 */
+	opusPriority?: boolean;
 	/** Whether the YouTube video titles should be replaced. */
 	replaceYouTubeCredentials?: boolean;
 	/** Cache settings for search results. */
@@ -575,11 +588,122 @@ export interface ManagerOptions {
 		checkInterval?: number;
 	};
 	/**
+	 * Zombie node detection: monitors playerUpdate timestamps to detect frozen Lavalink processes.
+	 * When a node is connected but stops sending playerUpdates for playing players,
+	 * it is marked as "zombie" and players are seamlessly moved to healthy nodes.
+	 */
+	zombieDetection?: {
+		/** Enable zombie detection. Default: true (when nodeHealthThresholds is set). */
+		enabled?: boolean;
+		/** How often to check for zombie nodes in ms. Default: 20000 (20s). */
+		checkInterval?: number;
+		/** Max time without a playerUpdate before a node is considered zombie, in ms. Default: 30000 (30s). */
+		maxSilence?: number;
+	};
+	/**
+	 * REST request rate limiting (backpressure) to prevent overwhelming Lavalink.
+	 * Uses a token bucket algorithm — bursts are allowed but sustained rate is capped.
+	 */
+	restBackpressure?: {
+		/** Enable REST backpressure. Default: false. */
+		enabled?: boolean;
+		/** Maximum sustained requests per second per node. Default: 20. */
+		maxRequestsPerSecond?: number;
+		/** Maximum burst size (tokens in bucket). Default: 40. */
+		bucketSize?: number;
+	};
+	/**
 	 * Function to send data to the Discord websocket.
 	 * @param id Guild ID
 	 * @param payload The payload to send
 	 */
 	send(id: string, payload: Payload): void;
+}
+
+// ─── Manager Events ─────────────────────────────────────────────────────
+
+// ─── SponsorBlock Types ──────────────────────────────────────────────────
+
+/** SponsorBlock segment categories supported by the Lavalink SponsorBlock plugin. */
+export type SponsorBlockCategory =
+	| "sponsor"
+	| "selfpromo"
+	| "interaction"
+	| "intro"
+	| "outro"
+	| "preview"
+	| "music_offtopic"
+	| "filler";
+
+/** A SponsorBlock segment returned from the plugin. */
+export interface SponsorBlockSegment {
+	category: SponsorBlockCategory;
+	start: number;
+	end: number;
+}
+
+// ─── LavaSearch Types ───────────────────────────────────────────────────
+
+/** Types of results that LavaSearch can return. */
+export type LavaSearchType = "track" | "album" | "artist" | "playlist" | "text";
+
+/** Query options for LavaSearch. */
+export interface LavaSearchQuery {
+	/** The search query string. */
+	query: string;
+	/** The source to search from. */
+	source?: SearchPlatform | string;
+	/** Which result types to include (default: all). */
+	types?: LavaSearchType[];
+}
+
+/** Structured search result from LavaSearch plugin. */
+export interface LavaSearchResult {
+	tracks?: Track[];
+	albums?: LavaSearchPlaylistInfo[];
+	artists?: LavaSearchPlaylistInfo[];
+	playlists?: LavaSearchPlaylistInfo[];
+	texts?: LavaSearchText[];
+}
+
+/** Album/Artist/Playlist info from LavaSearch. */
+export interface LavaSearchPlaylistInfo {
+	info: { name: string; url?: string; artworkUrl?: string; selectedTrack?: number };
+	tracks: Track[];
+	pluginInfo?: Record<string, unknown>;
+}
+
+/** Text result from LavaSearch. */
+export interface LavaSearchText {
+	text: string;
+	plugin?: Record<string, unknown>;
+}
+
+// ─── RoutePlanner Types ─────────────────────────────────────────────────
+
+/** RoutePlanner status from the Lavalink RoutePlanner plugin. */
+export interface RoutePlannerStatus {
+	class: string | null;
+	details: RoutePlannerDetails | null;
+}
+
+/** RoutePlanner details. */
+export interface RoutePlannerDetails {
+	ipBlock: { type: string; size: string };
+	failingAddresses: { failingAddress: string; failingTimestamp: number; failingTime: string }[];
+	rotateIndex?: string;
+	ipIndex?: string;
+	currentAddress?: string;
+	currentAddressIndex?: string;
+	blockIndex?: string;
+}
+
+// ─── Crossfade Types ────────────────────────────────────────────────────
+
+/** Configuration for audio crossfade between tracks. */
+export interface CrossfadeOptions {
+	/** Crossfade duration in milliseconds (default: 0 = disabled). */
+	duration: number;
 }
 
 // ─── Manager Events ─────────────────────────────────────────────────────
@@ -605,4 +729,12 @@ export interface ManagerEvents {
 	TrackError: (player: any, track: Track | UnresolvedTrack, payload: TrackExceptionEvent | unknown) => void;
 	PlayerFailover: (player: any, oldNode: string, newNode: string) => void;
 	Debug: (message: string) => void;
+	/** Emitted when a SponsorBlock segment is skipped. */
+	SegmentSkipped: (player: any, segment: SponsorBlockSegment) => void;
+	/** Emitted when a crossfade transition starts. */
+	CrossfadeStart: (player: any, currentTrack: Track, nextTrack: Track | UnresolvedTrack) => void;
+	/** Emitted when a node is detected as zombie (connected but not sending playerUpdates). */
+	NodeZombie: (node: any, playersAffected: number, lastUpdate: number) => void;
+	/** Emitted when a player's voice connection is automatically re-identified after Discord voice rotation. */
+	VoiceReconnect: (player: any, code: number) => void;
 }

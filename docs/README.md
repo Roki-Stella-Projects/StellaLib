@@ -19,6 +19,8 @@ Welcome to the StellaLib wiki-style documentation. These guides cover everything
 | 11 | [Autoplay Engine](11-autoplay.md) | Smart auto-mix — seeds, scoring, recommendations, fallback chain |
 | 12 | [Player State Persistence](12-player-state-persistence.md) | Full player state persistence — autoplay, queue, filters survive restarts |
 | 13 | [Seamless Failover](13-seamless-failover.md) | Multi-layer node failover — automatic, proactive, and zero-interruption |
+| 14 | [Infrastructure Resilience](14-infrastructure-resilience.md) | Zombie detection, REST backpressure, track serialization, voice hot-swap |
+| 15 | [Plugin Support](15-plugin-support.md) | SponsorBlock, LavaSearch, RoutePlanner, Crossfade, Auto-ducking, Opus priority |
 
 ## Quick Links
 

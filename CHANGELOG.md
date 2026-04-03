@@ -5,6 +5,56 @@ All notable changes to StellaLib will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-04
+
+### Added
+- **Zombie Node Detection** — Monitors `playerUpdate` timestamps on each node. When a node is connected but stops sending player updates for playing players (default: 30s silence), it is flagged as "zombie" and players are seamlessly moved to healthy nodes. Catches frozen Lavalink processes that pass TCP/heartbeat checks but have internally deadlocked. Configure via `ManagerOptions.zombieDetection` (`checkInterval`, `maxSilence`). New `NodeZombie` event
+- **REST Backpressure (Token Bucket)** — Global request rate limiter in `StellaRest` using a token bucket algorithm. Prevents self-DDoS when 100+ users run `/play` simultaneously. Bursts are allowed (up to `bucketSize`) but sustained rate is capped (default: 20 req/s). Requests queue in FIFO order when the bucket is empty. Configure via `ManagerOptions.restBackpressure` (`maxRequestsPerSecond`, `bucketSize`). `rest.pendingRequests` getter for monitoring
+- **Track Serialization (Memory Protection)** — `queue.compactQueue()` strips heavy metadata (pluginInfo, customData, thumbnail, artworkUrl, isrc) from queued tracks, keeping only what's needed for playback (`encoded`, `title`, `author`, `duration`, `uri`). At 700+ servers with 50-track queues, reduces RAM by 50-70%. `queue.memoryEstimate` getter for monitoring. `StellaQueue.isCompacted(track)` static helper
+- **Voice Hot-Swapping (Silent Re-Identify)** — When Discord rotates voice servers (code 4015) or a UDP desync occurs (code 4000), `player.reconnectVoice()` refreshes the voice token and endpoint without clearing the queue or filters. The user hears a ~1s gap, then music resumes automatically. Code 4006 (session invalid) also attempts re-identify before giving up. New `VoiceReconnect` event
+
+### Improved
+- **`socketClosed` handler** — Now distinguishes between recoverable codes (4000, 4015, 4006 → auto-reconnect) and fatal codes (4014 → cleanup). Previously all non-4014 codes were ignored
+- **Node `lastPlayerUpdate` tracking** — Public timestamp property updated on every `playerUpdate` WebSocket message, used by zombie detection and available for external monitoring
+- **`StellaRest.destroy()`** — New method to clean up the token bucket rate limiter on node shutdown
+- **`StellaRest.pendingRequests`** — Getter that returns the number of requests waiting in the backpressure queue
+
+## [1.2.0] - 2026-04-04
+
+### Added
+- **SponsorBlock integration** — `player.setSponsorBlock(categories)`, `player.getSponsorBlock()`, `player.clearSponsorBlock()` for auto-skipping sponsor segments, intros, outros, and more. Requires the SponsorBlock Lavalink plugin. New `SegmentSkipped` event
+- **LavaSearch structured search** — `manager.lavaSearch(query)` returns rich results with tracks, albums, artists, playlists, and text suggestions. Requires the LavaSearch Lavalink plugin. New types: `LavaSearchQuery`, `LavaSearchResult`, `LavaSearchPlaylistInfo`, `LavaSearchText`
+- **RoutePlanner API** — `manager.getRoutePlannerStatus()`, `manager.freeRoutePlannerAddress(address)`, `manager.freeAllRoutePlannerAddresses()` for IP rotation management and anti-429 monitoring. New types: `RoutePlannerStatus`, `RoutePlannerDetails`
+- **Opus priority search** — `ManagerOptions.opusPriority: true` re-orders search results so Opus-native sources (SoundCloud, YouTube Music) appear first. Discord uses Opus natively — zero transcode = lower CPU + best fidelity
+- **Crossfade emulation** — `player.setCrossfade(ms)` enables smooth volume fade-out transitions between tracks. Monitors track position and gradually reduces volume as the current track approaches its end. Volume auto-restores on `TrackStart`. New `CrossfadeStart` event
+- **Auto-ducking** — `player.duck(volume)` / `player.unduck()` for temporarily reducing music volume during TTS or voice announcements. `player.isDucked` getter
+- **Buffer duration control** — `player.setBufferDuration(ms)` for adjusting audio stream buffer size
+- **WebSocket compression** — `NodeOptions.wsCompression: true` enables per-message deflate compression, reducing network overhead by up to 60% for high-traffic bots
+- **REST PUT method** — `rest.put(endpoint, body)` for plugin APIs that require PUT requests
+
+### Fixed
+- **`Manager.destroy(guild)` silently leaked resources** — Previously only deleted the player from the map without calling `player.destroy()`. Now properly disconnects, stops timers, and cleans up before removing
+- **Fire-and-forget REST calls** — `player.setVolume()`, `player.stop()`, `player.pause()`, `player.seek()`, `player.restart()` now properly `await` their REST calls instead of silently ignoring failures
+- **`Filters.setFilter()` double REST call** — The `setFilter()` dispatcher called `updateFilters()` after the individual filter method already triggered it via `applyFilter()`. Removed the redundant call
+- **`Filters.clearFilters()` instance replacement bug** — Previously created a new `Filters` instance on `this.player.filters` but continued modifying the old `this` instance. Now directly resets all properties on the current instance
+- **`Filters.setVaporwave()` double REST call** — Compound filters (vaporwave) that modify both equalizer and timescale now batch the changes: first change is applied without update (`shouldUpdate=false`), second triggers the single REST call
+
+### Improved
+- **`Method` type** — Added `"PUT"` to the union for plugin API compatibility
+
+## [1.1.3] - 2026-04-03
+
+### Fixed
+- **AutoMix style drift** — The autoplay engine now stays on-style across sessions. Previously, short or generic artist names (e.g. `sea.`) caused SoundCloud searches to return completely unrelated tracks, which compounded with each pick — drifting from Thai pop into Schranz edits within 3 songs
+- **Short/generic author search pollution** — Strategy 2 no longer searches SoundCloud with bare author names shorter than 5 meaningful characters. For example, `sea.` now searches `scsearch:sea. สมดุลรัก Balance` (author + title keywords) instead of `scsearch:sea.`, yielding accurate results
+- **Autoplay anchor lost on style drift** — Introduced `player.autoplayAnchor`: the very first track that starts each autoplay session. The anchor is preserved permanently (not rotated out like the 5-track seed pool), so every scoring call can still measure similarity to the user's original choice even after many tracks
+- **Scoring only compared against `previousTrack`** — Candidate scoring now includes two additional layers: anchor similarity (+25 author match, +18 title keyword overlap, +5 source match) and seed-pool-wide author affinity (bonus if the candidate's artist appears in any of the last 5 seeds). This pulls candidate selection back toward the original style even when the pool has drifted
+- **`setAutoplay(false)` now resets state** — Disabling autoplay now clears `autoplayAnchor`, `autoplaySeedPool`, and `autoplayHistory`, so enabling it again starts fresh rather than inheriting stale context from the previous session
+
+### Improved
+- **Strategy 2 search query order** — Author + title-keyword combination is always tried first before bare author. YouTube fallback also includes title context instead of a generic `music` suffix
+- **Cross-artist seed search** — When using an alternate seed pool author for cross-artist transitions, short names (<= 5 chars stripped) now also receive title keyword context to avoid generic search results
+
 ## [1.1.2] - 2026-04-04
 
 ### Added
@@ -116,6 +166,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ws` ^8.18.1
 - `tiny-typed-emitter` ^2.1.0
 
+[1.3.0]: https://github.com/Roki-Stella-Projects/StellaLib/releases/tag/v1.3.0
+[1.2.0]: https://github.com/Roki-Stella-Projects/StellaLib/releases/tag/v1.2.0
+[1.1.3]: https://github.com/Roki-Stella-Projects/StellaLib/releases/tag/v1.1.3
 [1.1.2]: https://github.com/Roki-Stella-Projects/StellaLib/releases/tag/v1.1.2
 [1.1.1]: https://github.com/Roki-Stella-Projects/StellaLib/releases/tag/v1.1.1
 [1.1.0]: https://github.com/Roki-Stella-Projects/StellaLib/releases/tag/v1.1.0

@@ -221,13 +221,13 @@ class Filters {
 	 */
 	public setVaporwave(status: boolean): this {
 		if (status) {
-			return this.setEqualizer(vaporwaveEqualizer)
-				.setTimescale({ pitch: 0.55 })
-				.setFilterStatus("vaporwave", status);
+			this.applyFilter({ property: "equalizer", value: vaporwaveEqualizer }, false);
+			this.applyFilter({ property: "timescale", value: { pitch: 0.55 } }, true);
+			return this.setFilterStatus("vaporwave", status);
 		} else {
-			return this.setEqualizer([])
-				.setTimescale(null)
-				.setFilterStatus("vaporwave", status);
+			this.applyFilter({ property: "equalizer", value: [] }, false);
+			this.applyFilter({ property: "timescale", value: null }, true);
+			return this.setFilterStatus("vaporwave", status);
 		}
 	}
 
@@ -285,7 +285,8 @@ class Filters {
 			default: throw new Error(`Invalid filter: "${filter}"`);
 		}
 
-		await this.updateFilters();
+		// Note: individual filter methods already call updateFilters() via applyFilter(),
+		// so we don't need to call it again here.
 		return this;
 	}
 
@@ -304,13 +305,13 @@ class Filters {
 			vaporwave: false,
 		};
 
-		this.player.filters = new Filters(this.player);
-		this.setEqualizer([]);
-		this.setDistortion(null);
-		this.setKaraoke(false);
-		this.setRotation(null);
-		this.setTimescale(null);
-		this.setVibrato(null);
+		this.distortion = null;
+		this.equalizer = [];
+		this.karaoke = null;
+		this.rotation = null;
+		this.timescale = null;
+		this.vibrato = null;
+		this.volume = 1.0;
 
 		await this.updateFilters();
 		return this;

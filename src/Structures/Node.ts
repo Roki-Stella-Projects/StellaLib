@@ -61,6 +61,9 @@ class StellaNode {
 	/** Detected Lavalink version (3 or 4). Auto-detected on connect. */
 	public version: LavalinkVersion = 4;
 
+	/** Timestamp of the last playerUpdate received from this node. Used for zombie detection. */
+	public lastPlayerUpdate = 0;
+
 	private static _manager: StellaManager;
 	private reconnectTimeout?: ReturnType<typeof setTimeout>;
 	private reconnectAttempts = 1;
@@ -273,7 +276,21 @@ class StellaNode {
 
 		this.manager.emit("Debug", `[Node:${this.options.identifier}] Connecting to ${url}${this.sessionId ? " (resuming)" : ""}`);
 
-		this.socket = new WebSocket(url, { headers });
+		const wsOptions: WebSocket.ClientOptions = { headers };
+
+		// Enable per-message deflate compression if configured
+		if (this.options.wsCompression) {
+			wsOptions.perMessageDeflate = {
+				zlibDeflateOptions: { level: 6 },
+				threshold: 128,
+			};
+			this.manager.emit(
+				"Debug",
+				`[Node:${this.options.identifier}] WebSocket compression enabled (perMessageDeflate)`,
+			);
+		}
+
+		this.socket = new WebSocket(url, wsOptions);
 		this.socket.on("open", this.open.bind(this));
 		this.socket.on("close", this.close.bind(this));
 		this.socket.on("message", this.message.bind(this));
@@ -576,6 +593,7 @@ class StellaNode {
 				break;
 
 			case "playerUpdate": {
+				this.lastPlayerUpdate = Date.now();
 				const player = this.manager.players.get(payload.guildId);
 				if (player) {
 					player.position = payload.state.position || 0;
@@ -861,6 +879,19 @@ class StellaNode {
 	protected trackStart(player: StellaPlayer, track: Track, payload: TrackStartEvent): void {
 		player.playing = true;
 		player.paused = false;
+
+		// Restore volume after crossfade (previous track faded out, new track starts at full volume)
+		if (player.crossfadeDuration > 0) {
+			this.manager.emit(
+				"Debug",
+				`[Player:${player.guild}] Crossfade: restoring volume to ${player.volume} for new track`,
+			);
+			player.node.rest.updatePlayer({
+				guildId: player.guild,
+				data: { volume: player.volume },
+			}).catch(() => {});
+		}
+
 		this.manager.emit("TrackStart", player, track, payload);
 	}
 
@@ -911,18 +942,24 @@ class StellaNode {
 		const historySet = new Set(player.autoplayHistory);
 
 		// ── Update seed pool with the track that just finished ──────────────
-		player.autoplaySeedPool.push({
+		const newSeedEntry = {
 			title: previousTrack.title ?? "",
 			author: previousTrack.author ?? "",
 			uri: previousTrack.uri ?? "",
 			duration: previousTrack.duration ?? 0,
 			sourceName: previousTrack.sourceName ?? "",
-		});
+		};
+		// Set anchor on first call — anchors the style to the user's original pick
+		if (!player.autoplayAnchor) {
+			player.autoplayAnchor = newSeedEntry;
+		}
+		player.autoplaySeedPool.push(newSeedEntry);
 		if (player.autoplaySeedPool.length > 5) {
 			player.autoplaySeedPool.shift();
 		}
 
 		const seedPool = player.autoplaySeedPool;
+		const anchor = player.autoplayAnchor;
 		const avgDuration = seedPool.reduce((sum, s) => sum + s.duration, 0) / (seedPool.length || 1);
 
 		// ── Transition scoring engine ───────────────────────────────────────
@@ -935,29 +972,64 @@ class StellaNode {
 			else if (durDiff < 60_000) score += 25;
 			else if (durDiff < 120_000) score += 10;
 
+			const candAuthor = (candidate.author ?? "").toLowerCase();
+			const candTitle = (candidate.title ?? "").toLowerCase();
+			const candTitleWords = candTitle.split(/[\s\-_()[\]]+/).filter((w) => w.length > 2);
+
 			// Author match against previous track
 			const prevAuthor = (previousTrack.author ?? "").toLowerCase();
-			const candAuthor = (candidate.author ?? "").toLowerCase();
 			if (prevAuthor && candAuthor) {
 				if (candAuthor === prevAuthor) {
 					score += 30;
 				} else {
 					// Partial word overlap (e.g. "Silo" in "Silo Music")
 					const prevWords = prevAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
-					const candWords = candAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
-					const overlap = prevWords.filter((w) => candWords.includes(w)).length;
+					const cWords = candAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
+					const overlap = prevWords.filter((w) => cWords.includes(w)).length;
 					score += Math.min(overlap * 10, 20);
 				}
 			}
 
 			// Title keyword overlap (shared theme/vibe/language)
 			const prevTitle = (previousTrack.title ?? "").toLowerCase();
-			const candTitle = (candidate.title ?? "").toLowerCase();
-			if (prevTitle && candTitle) {
+			if (prevTitle) {
 				const prevWords = prevTitle.split(/[\s\-_()[\]]+/).filter((w) => w.length > 2);
-				const candWords = candTitle.split(/[\s\-_()[\]]+/).filter((w) => w.length > 2);
-				const overlap = prevWords.filter((w) => candWords.includes(w)).length;
+				const overlap = prevWords.filter((w) => candTitleWords.includes(w)).length;
 				score += Math.min(overlap * 8, 24);
+			}
+
+			// ── Anchor similarity (prevents style drift from the user's original pick) ──
+			if (anchor) {
+				const anchorAuthor = anchor.author.toLowerCase();
+				const anchorTitle = anchor.title.toLowerCase();
+				// Author match to anchor
+				if (candAuthor && anchorAuthor) {
+					if (candAuthor === anchorAuthor) {
+						score += 25;
+					} else {
+						const anchorWords = anchorAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
+						const cWords = candAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
+						const overlap = anchorWords.filter((w) => cWords.includes(w)).length;
+						score += Math.min(overlap * 8, 16);
+					}
+				}
+				// Title keyword overlap with anchor
+				if (anchorTitle) {
+					const anchorTitleWords = anchorTitle.split(/[\s\-_()[\]]+/).filter((w) => w.length > 2);
+					const overlap = anchorTitleWords.filter((w) => candTitleWords.includes(w)).length;
+					score += Math.min(overlap * 6, 18);
+				}
+				// Source match to anchor (keep same platform as original)
+				if (candidate.sourceName === anchor.sourceName) {
+					score += 5;
+				}
+			}
+
+			// ── Seed-pool-wide author affinity ──────────────────────────────
+			// Bonus if candidate's author appears anywhere in recent seeds
+			if (candAuthor) {
+				const seedAuthorMatches = seedPool.filter((s) => s.author.toLowerCase() === candAuthor).length;
+				if (seedAuthorMatches > 0) score += Math.min(seedAuthorMatches * 8, 16);
 			}
 
 			// Seed pool diversity bonus: avoid same author for 3+ tracks in a row
@@ -1120,14 +1192,43 @@ class StellaNode {
 		// Build diverse search queries from the seed pool to keep the mix flowing
 		if (previousTrack.author) {
 			const uniqueAuthors = [...new Set(seedPool.map((s) => s.author).filter(Boolean))];
-			const searchQueries = [
-				{ source: "soundcloud", query: previousTrack.author },
-				// Also try another recent artist for cross-artist transitions
-				...(uniqueAuthors.length > 1
-					? [{ source: "soundcloud", query: uniqueAuthors.find((a) => a !== previousTrack.author) ?? previousTrack.author }]
-					: []),
-				{ source: "youtube", query: `${previousTrack.author} music` },
-			];
+
+			// Extract meaningful title keywords (skip noise words) for search context
+			const titleKeywords = (previousTrack.title ?? "")
+				.split(/[\s\-_()[\],.'"!?]+/)
+				.filter((w) => w.length > 2 && !/^(feat|ft|remix|version|official|video|audio|lyrics|mv|hd|hq|high|school|the|and|for)$/i.test(w))
+				.slice(0, 3)
+				.join(" ");
+
+			// Determine if author name is too short/generic for a standalone search
+			// Strip punctuation/symbols to measure actual content length
+			const strippedAuthor = previousTrack.author.replace(/[^\p{L}\p{N}]/gu, "");
+			const isShortAuthor = strippedAuthor.length <= 5;
+
+			const searchQueries: { source: string; query: string }[] = [];
+
+			// Always try author + title keywords first — most targeted, avoids generic name pollution
+			if (titleKeywords) {
+				searchQueries.push({ source: "soundcloud", query: `${previousTrack.author} ${titleKeywords}` });
+			}
+			// Only use bare author name if it's long/unique enough to be a meaningful search term
+			if (!isShortAuthor) {
+				searchQueries.push({ source: "soundcloud", query: previousTrack.author });
+			}
+			// Cross-artist from seed pool (also with title context for short names)
+			if (uniqueAuthors.length > 1) {
+				const altAuthor = uniqueAuthors.find((a) => a !== previousTrack.author);
+				if (altAuthor) {
+					const altStripped = altAuthor.replace(/[^\p{L}\p{N}]/gu, "");
+					if (altStripped.length > 5) {
+						searchQueries.push({ source: "soundcloud", query: altAuthor });
+					} else if (titleKeywords) {
+						searchQueries.push({ source: "soundcloud", query: `${altAuthor} ${titleKeywords}` });
+					}
+				}
+			}
+			// YouTube fallback
+			searchQueries.push({ source: "youtube", query: `${previousTrack.author} ${titleKeywords || "music"}` });
 
 			for (const sq of searchQueries) {
 				const found = await tryMixSearch(sq);
@@ -1282,18 +1383,72 @@ class StellaNode {
 	protected socketClosed(player: StellaPlayer, payload: WebSocketClosedEvent): void {
 		this.manager.emit("SocketClosed", player, payload);
 
-		// 4014 = Disconnected by Discord (bot was kicked/moved out of voice)
-		// 4006 = Session is no longer valid
-		const VOICE_FATAL_CODES = [4014, 4006];
-		if (VOICE_FATAL_CODES.includes(payload.code)) {
+		// Voice rotation / desync codes — recoverable via silent re-identify
+		// 4015 = Voice server changed (Discord rotated the voice server)
+		// 4000 = Unknown error (often a UDP desync, recoverable)
+		const VOICE_RECONNECT_CODES = [4015, 4000];
+		if (VOICE_RECONNECT_CODES.includes(payload.code) && player.voiceChannel) {
 			this.manager.emit(
 				"Debug",
-				`[Player:${player.guild}] Voice socket closed with code ${payload.code} (${payload.reason || "no reason"}) — cleaning up player`,
+				`[Player:${player.guild}] Voice socket closed with recoverable code ${payload.code} — attempting silent re-identify`,
+			);
+
+			player.reconnectVoice().then(() => {
+				this.manager.emit("VoiceReconnect", player, payload.code);
+				this.manager.emit(
+					"Debug",
+					`[Player:${player.guild}] Voice re-identified successfully after code ${payload.code}`,
+				);
+			}).catch((err) => {
+				this.manager.emit(
+					"Debug",
+					`[Player:${player.guild}] Voice re-identify failed: ${err instanceof Error ? err.message : String(err)} — cleaning up`,
+				);
+				player.voiceReady = false;
+				player.connected = false;
+				player.playing = false;
+				player.state = "DISCONNECTED";
+			});
+			return;
+		}
+
+		// 4014 = Disconnected by Discord (bot was kicked/moved out of voice)
+		if (payload.code === 4014) {
+			this.manager.emit(
+				"Debug",
+				`[Player:${player.guild}] Voice socket closed with code 4014 (kicked from voice) — cleaning up player`,
 			);
 			player.voiceReady = false;
 			player.connected = false;
 			player.playing = false;
 			player.state = "DISCONNECTED";
+			return;
+		}
+
+		// 4006 = Session no longer valid — try re-identify, fall back to cleanup
+		if (payload.code === 4006 && player.voiceChannel) {
+			this.manager.emit(
+				"Debug",
+				`[Player:${player.guild}] Voice session invalidated (4006) — attempting re-identify`,
+			);
+
+			player.reconnectVoice().then(() => {
+				this.manager.emit("VoiceReconnect", player, payload.code);
+				this.manager.emit(
+					"Debug",
+					`[Player:${player.guild}] Voice re-identified after session invalidation`,
+				);
+			}).catch(() => {
+				this.manager.emit(
+					"Debug",
+					`[Player:${player.guild}] Voice re-identify failed after 4006 — disconnecting`,
+				);
+				player.voiceReady = false;
+				player.connected = false;
+				player.playing = false;
+				player.state = "DISCONNECTED";
+			});
+			return;
 		}
 	}
 }

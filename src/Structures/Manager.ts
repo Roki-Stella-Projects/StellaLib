@@ -29,6 +29,12 @@ import type {
 	ManagerEvents,
 	Payload,
 	PlayerStateStore,
+	LavaSearchQuery,
+	LavaSearchResult,
+	LavaSearchType,
+	LavaSearchPlaylistInfo,
+	LavaSearchText,
+	RoutePlannerStatus,
 } from "./Types";
 import type { StellaNode } from "./Node";
 import type { StellaPlayer } from "./Player";
@@ -68,6 +74,8 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 	private pruneInterval?: ReturnType<typeof setInterval>;
 	/** Reference to node health check interval for cleanup. */
 	private healthCheckInterval?: ReturnType<typeof setInterval>;
+	/** Reference to zombie detection interval for cleanup. */
+	private zombieCheckInterval?: ReturnType<typeof setInterval>;
 
 	/** Returns the nodes sorted by least CPU load. */
 	public get leastLoadNode(): Map<string, StellaNode> {
@@ -241,8 +249,94 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 			this.emit("Debug", `[Manager] Node health monitor started (every ${interval}ms)`);
 		}
 
+		// Start zombie node detection
+		const zombie = this.options.zombieDetection;
+		if (zombie?.enabled !== false) {
+			const interval = zombie?.checkInterval ?? 20000;
+			this.zombieCheckInterval = setInterval(() => this.checkZombieNodes(), interval);
+			this.emit("Debug", `[Manager] Zombie node detection started (every ${interval}ms, max silence: ${zombie?.maxSilence ?? 30000}ms)`);
+		}
+
 		this.emit("Debug", "[Manager] Initialized");
 		return this;
+	}
+
+	/**
+	 * Detects "zombie" nodes: connected but no longer sending playerUpdates.
+	 * This catches frozen Lavalink processes that pass TCP/heartbeat checks but
+	 * have internally deadlocked. Players on zombie nodes hear silence.
+	 */
+	private checkZombieNodes(): void {
+		const maxSilence = this.options.zombieDetection?.maxSilence ?? 30000;
+		const now = Date.now();
+
+		for (const node of this.nodes.values()) {
+			if (!node.connected) continue;
+
+			// Only flag a node as zombie if it has playing players
+			const playingOnNode = [...this.players.values()].filter(
+				(p) => p.node === node && p.playing,
+			);
+			if (!playingOnNode.length) continue;
+
+			// If we've never received a playerUpdate but there are playing players,
+			// give the node a grace period equal to maxSilence from connection time
+			if (node.lastPlayerUpdate === 0) {
+				if (node.lastHeartbeatAck > 0 && (now - node.lastHeartbeatAck) > maxSilence) {
+					// Node has been alive long enough — flag it
+				} else {
+					continue;
+				}
+			}
+
+			const silence = now - (node.lastPlayerUpdate || node.lastHeartbeatAck);
+			if (silence <= maxSilence) continue;
+
+			// Node is zombie!
+			this.emit(
+				"Debug",
+				`[Zombie] Node ${node.options.identifier} detected as zombie — ${playingOnNode.length} playing player(s), last playerUpdate ${silence}ms ago`,
+			);
+			this.emit("NodeZombie", node, playingOnNode.length, node.lastPlayerUpdate);
+
+			// Find healthy non-zombie nodes
+			const healthyNodes = [...this.nodes.values()].filter((n) => {
+				if (n === node || !n.connected) return false;
+				// Don't migrate to another node that's also zombie
+				const nPlaying = [...this.players.values()].filter((p) => p.node === n && p.playing);
+				if (nPlaying.length > 0 && n.lastPlayerUpdate > 0 && (now - n.lastPlayerUpdate) > maxSilence) return false;
+				return true;
+			});
+
+			if (!healthyNodes.length) {
+				this.emit(
+					"Debug",
+					`[Zombie] No healthy nodes to failover from zombie ${node.options.identifier} — forcing reconnect`,
+				);
+				// Force kill the socket to trigger reconnect cycle
+				node.socket?.terminate();
+				continue;
+			}
+
+			healthyNodes.sort((a, b) => a.penalties - b.penalties);
+
+			for (const player of playingOnNode) {
+				const target = healthyNodes[0];
+				this.emit(
+					"Debug",
+					`[Zombie] Moving player ${player.guild} from zombie ${node.options.identifier} → ${target.options.identifier}`,
+				);
+				player.moveNode(target.options.identifier).catch((err) => {
+					this.emit(
+						"Debug",
+						`[Zombie] Failed to move player ${player.guild}: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				});
+			}
+
+			// Force reconnect the zombie node
+			node.socket?.terminate();
+		}
 	}
 
 	/**
@@ -386,6 +480,20 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 					playlist,
 				};
 
+				// Opus priority: sort tracks so Opus-native sources appear first
+				// SoundCloud and YouTube Music serve Opus natively — Discord uses Opus,
+				// so zero-transcode = lower CPU + better audio fidelity.
+				if (this.options.opusPriority && result.tracks.length > 1) {
+					const OPUS_SOURCES = new Set(["soundcloud", "youtube", "ytmusic"]);
+					result.tracks.sort((a, b) => {
+						const aIsOpus = OPUS_SOURCES.has(a.sourceName?.toLowerCase() ?? "");
+						const bIsOpus = OPUS_SOURCES.has(b.sourceName?.toLowerCase() ?? "");
+						if (aIsOpus && !bIsOpus) return -1;
+						if (!aIsOpus && bIsOpus) return 1;
+						return 0;
+					});
+				}
+
 				if (this.options.replaceYouTubeCredentials) {
 					let tracksToReplace: Track[] = [];
 					if (result.loadType === "playlist" && result.playlist) {
@@ -461,6 +569,107 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 		};
 	}
 
+	// ── LavaSearch Integration ────────────────────────────────────────────
+
+	/**
+	 * Performs a structured search using the LavaSearch Lavalink plugin.
+	 * Returns rich results including tracks, albums, artists, playlists, and text suggestions.
+	 * Requires the LavaSearch plugin to be installed on the Lavalink server.
+	 *
+	 * @param query The search query or LavaSearchQuery object.
+	 * @param requester The user who requested the search.
+	 * @example
+	 * ```ts
+	 * const results = await manager.lavaSearch({ query: "Daft Punk", source: "spotify", types: ["track", "album", "artist"] });
+	 * console.log(results.tracks, results.albums, results.artists);
+	 * ```
+	 */
+	public async lavaSearch(
+		query: string | LavaSearchQuery,
+		requester?: string,
+	): Promise<LavaSearchResult> {
+		const node = this.useableNodes;
+		if (!node) throw new Error("No available nodes.");
+
+		const _query: LavaSearchQuery = typeof query === "string" ? { query } : query;
+		const source = _query.source ?? this.options.defaultSearchPlatform ?? "youtube";
+		const prefix = StellaManager.DEFAULT_SOURCES[source as SearchPlatform] ?? source;
+		const search = `${prefix}:${_query.query}`;
+
+		const raw = (await node.rest.lavaSearch(search, _query.types)) as Record<string, unknown>;
+		if (!raw || typeof raw !== "object") return {};
+
+		const result: LavaSearchResult = {};
+
+		// Build Track[] from raw track data
+		if (Array.isArray(raw.tracks)) {
+			result.tracks = (raw.tracks as TrackData[]).map((t) => TrackUtils.build(t, requester));
+		}
+
+		// Build album/artist/playlist results
+		for (const key of ["albums", "artists", "playlists"] as const) {
+			if (Array.isArray(raw[key])) {
+				result[key] = (raw[key] as Array<{ info: Record<string, unknown>; tracks: TrackData[]; pluginInfo?: Record<string, unknown> }>).map((item) => ({
+					info: item.info as LavaSearchPlaylistInfo["info"],
+					tracks: (item.tracks ?? []).map((t) => TrackUtils.build(t, requester)),
+					pluginInfo: item.pluginInfo,
+				}));
+			}
+		}
+
+		// Text results (autocomplete suggestions)
+		if (Array.isArray(raw.texts)) {
+			result.texts = raw.texts as LavaSearchText[];
+		}
+
+		return result;
+	}
+
+	// ── RoutePlanner API ─────────────────────────────────────────────────
+
+	/**
+	 * Gets the current RoutePlanner status from the Lavalink server.
+	 * Useful for monitoring IP rotation and identifying failing addresses.
+	 *
+	 * @param nodeIdentifier Optional specific node to query. Defaults to best available.
+	 */
+	public async getRoutePlannerStatus(nodeIdentifier?: string): Promise<RoutePlannerStatus> {
+		const node = nodeIdentifier
+			? this.nodes.get(nodeIdentifier)
+			: this.useableNodes;
+		if (!node) throw new Error("No available nodes.");
+		return await node.rest.getRoutePlannerStatus();
+	}
+
+	/**
+	 * Unmarks a specific IP address as failing in the RoutePlanner.
+	 *
+	 * @param address The IP address to free.
+	 * @param nodeIdentifier Optional specific node. Defaults to best available.
+	 */
+	public async freeRoutePlannerAddress(address: string, nodeIdentifier?: string): Promise<void> {
+		const node = nodeIdentifier
+			? this.nodes.get(nodeIdentifier)
+			: this.useableNodes;
+		if (!node) throw new Error("No available nodes.");
+		await node.rest.freeRoutePlannerAddress(address);
+	}
+
+	/**
+	 * Unmarks all failing IP addresses in the RoutePlanner.
+	 *
+	 * @param nodeIdentifier Optional specific node. Defaults to best available.
+	 */
+	public async freeAllRoutePlannerAddresses(nodeIdentifier?: string): Promise<void> {
+		const node = nodeIdentifier
+			? this.nodes.get(nodeIdentifier)
+			: this.useableNodes;
+		if (!node) throw new Error("No available nodes.");
+		await node.rest.freeAllRoutePlannerAddresses();
+	}
+
+	// ── Decode ───────────────────────────────────────────────────────────
+
 	/**
 	 * Decodes the base64 encoded tracks and returns a TrackData array.
 	 * @param tracks
@@ -504,10 +713,16 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 
 	/**
 	 * Destroys a player if it exists.
+	 * Properly cleans up the player (disconnects, stops timers) before removing.
 	 * @param guild
 	 */
 	public destroy(guild: string): void {
-		this.players.delete(guild);
+		const player = this.players.get(guild);
+		if (player) {
+			player.destroy();
+		} else {
+			this.players.delete(guild);
+		}
 	}
 
 	/**
@@ -696,6 +911,10 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 		if (this.healthCheckInterval) {
 			clearInterval(this.healthCheckInterval);
 			this.healthCheckInterval = undefined;
+		}
+		if (this.zombieCheckInterval) {
+			clearInterval(this.zombieCheckInterval);
+			this.zombieCheckInterval = undefined;
 		}
 		this.caches.clear();
 

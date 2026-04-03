@@ -24,6 +24,9 @@ import type {
 	PlayerStateSnapshot,
 	PlayerPersistData,
 	TrackPersistData,
+	SponsorBlockCategory,
+	SponsorBlockSegment,
+	CrossfadeOptions,
 } from "./Types";
 import type { StellaManager } from "./Manager";
 import type { StellaNode } from "./Node";
@@ -77,6 +80,8 @@ export class StellaPlayer {
 	public autoplaySeedPool: { title: string; author: string; uri: string; duration: number; sourceName: string }[] = [];
 	/** Max seed pool size. */
 	public static readonly SEED_POOL_MAX = 5;
+	/** Anchor track: the first track that started the current autoplay session. Used to prevent style drift. */
+	public autoplayAnchor: { title: string; author: string; uri: string; duration: number; sourceName: string } | null = null;
 	/** Whether the voice connection is ready. */
 	public connected = false;
 	/** The ping to the voice server in ms. */
@@ -97,6 +102,18 @@ export class StellaPlayer {
 	public voiceReady = false;
 	/** @hidden */
 	public voiceReadyResolvers: Array<() => void> = [];
+
+	/** Active SponsorBlock categories for this player. */
+	private sponsorBlockCategories: SponsorBlockCategory[] = [];
+
+	/** Crossfade configuration. */
+	private crossfadeOptions: CrossfadeOptions = { duration: 0 };
+	/** Crossfade interval timer. */
+	private crossfadeTimer?: ReturnType<typeof setInterval>;
+	/** Whether auto-ducking is active. */
+	private autoDuckActive = false;
+	/** Volume before ducking was applied. */
+	private preDuckVolume = 0;
 
 	/**
 	 * Set custom data.
@@ -336,6 +353,58 @@ export class StellaPlayer {
 		return this;
 	}
 
+	/**
+	 * Silently re-identifies the voice connection without clearing the queue or filters.
+	 * Used for "hot-swapping" when Discord rotates voice servers (code 4015/4000).
+	 * The user hears a ~1s gap, then music resumes automatically.
+	 */
+	public async reconnectVoice(): Promise<void> {
+		if (!this.voiceChannel) throw new Error("No voice channel to reconnect to.");
+
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Voice hot-swap: re-identifying to ${this.voiceChannel}`,
+		);
+
+		this.voiceReady = false;
+		this.state = "CONNECTING";
+
+		// Re-send the voice state to Discord to get a fresh token/endpoint
+		this.manager.options.send(this.guild, {
+			op: 4,
+			d: {
+				guild_id: this.guild,
+				channel_id: this.voiceChannel,
+				self_mute: this.options.selfMute || false,
+				self_deaf: this.options.selfDeafen || false,
+			},
+		});
+
+		// Wait for voice to be ready again (Discord will send new VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE)
+		await this.waitForVoice(10000);
+
+		// Resume playback at the current position
+		if (this.queue.current && this.playing) {
+			const resumePosition = this.position;
+			await this.node.rest.updatePlayer({
+				guildId: this.guild,
+				data: {
+					encodedTrack: this.queue.current.track,
+					position: resumePosition,
+					volume: this.volume,
+					paused: this.paused,
+				},
+			});
+
+			this.manager.emit(
+				"Debug",
+				`[Player:${this.guild}] Voice hot-swap: resumed at ${resumePosition}ms`,
+			);
+		}
+
+		this.state = "CONNECTED";
+	}
+
 	/** Destroys the player, cleaning up all timers and resources. */
 	public destroy(disconnect = true): void {
 		this.state = "DESTROYING";
@@ -454,6 +523,11 @@ export class StellaPlayer {
 		if (typeof botUser !== "object") throw new TypeError("botUser must be a user-object.");
 		this.isAutoplay = autoplayState;
 		this.set("Internal_BotUser", botUser);
+		if (!autoplayState) {
+			this.autoplayAnchor = null;
+			this.autoplaySeedPool = [];
+			this.autoplayHistory = [];
+		}
 		return this;
 	}
 
@@ -545,9 +619,9 @@ export class StellaPlayer {
 	 * Sets the player volume.
 	 * @param volume
 	 */
-	public setVolume(volume: number): this {
+	public async setVolume(volume: number): Promise<this> {
 		if (isNaN(volume)) throw new TypeError("Volume must be a number.");
-		this.node.rest.updatePlayer({
+		await this.node.rest.updatePlayer({
 			guildId: this.options.guild,
 			data: { volume },
 		});
@@ -620,26 +694,26 @@ export class StellaPlayer {
 	}
 
 	/** Restarts the current track to the start. */
-	public restart(): void {
+	public async restart(): Promise<void> {
 		if (!this.queue.current?.track) {
 			if (this.queue.length) this.play();
 			return;
 		}
-		this.node.rest.updatePlayer({
+		await this.node.rest.updatePlayer({
 			guildId: this.guild,
 			data: { position: 0, encodedTrack: this.queue.current?.track },
 		});
 	}
 
 	/** Stops the current track, optionally give an amount to skip to. */
-	public stop(amount?: number): this {
+	public async stop(amount?: number): Promise<this> {
 		if (typeof amount === "number" && amount > 1) {
 			if (amount > this.queue.length)
 				throw new RangeError("Cannot skip more than the queue length.");
 			this.queue.splice(0, amount - 1);
 		}
 
-		this.node.rest.updatePlayer({
+		await this.node.rest.updatePlayer({
 			guildId: this.guild,
 			data: { encodedTrack: null },
 		});
@@ -651,7 +725,7 @@ export class StellaPlayer {
 	 * Pauses the current track.
 	 * @param pause
 	 */
-	public pause(pause: boolean): this {
+	public async pause(pause: boolean): Promise<this> {
 		if (typeof pause !== "boolean")
 			throw new RangeError('Pause can only be "true" or "false".');
 		if (this.paused === pause || !this.queue.totalSize) return this;
@@ -660,7 +734,7 @@ export class StellaPlayer {
 		this.playing = !pause;
 		this.paused = pause;
 
-		this.node.rest.updatePlayer({
+		await this.node.rest.updatePlayer({
 			guildId: this.guild,
 			data: { paused: pause },
 		});
@@ -682,7 +756,7 @@ export class StellaPlayer {
 	 * Seeks to the position in the current track.
 	 * @param position
 	 */
-	public seek(position: number): this | undefined {
+	public async seek(position: number): Promise<this | undefined> {
 		if (!this.queue.current) return undefined;
 		position = Number(position);
 
@@ -692,7 +766,7 @@ export class StellaPlayer {
 
 		this.position = position;
 
-		this.node.rest.updatePlayer({
+		await this.node.rest.updatePlayer({
 			guildId: this.guild,
 			data: { position },
 		});
@@ -764,6 +838,227 @@ export class StellaPlayer {
 		if (!this.maxQueueSize || this.maxQueueSize <= 0) return Infinity;
 		return Math.max(0, this.maxQueueSize - this.queue.length);
 	}
+
+	// ── SponsorBlock Integration ─────────────────────────────────────────
+
+	/**
+	 * Sets SponsorBlock categories to auto-skip for this player.
+	 * Requires the SponsorBlock Lavalink plugin.
+	 *
+	 * @param categories The categories to skip (e.g., ["sponsor", "selfpromo", "intro"]).
+	 * @example
+	 * ```ts
+	 * player.setSponsorBlock(["sponsor", "selfpromo", "interaction"]);
+	 * ```
+	 */
+	public async setSponsorBlock(categories: SponsorBlockCategory[]): Promise<void> {
+		await this.node.rest.setSponsorBlock(this.guild, categories);
+		this.sponsorBlockCategories = [...categories];
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] SponsorBlock categories set: ${categories.join(", ")}`,
+		);
+	}
+
+	/**
+	 * Gets the current SponsorBlock categories for this player.
+	 * @returns The active SponsorBlock segments from the server.
+	 */
+	public async getSponsorBlock(): Promise<SponsorBlockSegment[]> {
+		return await this.node.rest.getSponsorBlock(this.guild);
+	}
+
+	/**
+	 * Removes all SponsorBlock categories from this player.
+	 */
+	public async clearSponsorBlock(): Promise<void> {
+		await this.node.rest.deleteSponsorBlock(this.guild);
+		this.sponsorBlockCategories = [];
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] SponsorBlock categories cleared`,
+		);
+	}
+
+	/**
+	 * Returns the locally-cached SponsorBlock categories.
+	 * Does not make a REST call — use getSponsorBlock() for live data.
+	 */
+	public get sponsorBlock(): SponsorBlockCategory[] {
+		return [...this.sponsorBlockCategories];
+	}
+
+	// ── Crossfade Emulation ──────────────────────────────────────────────
+
+	/**
+	 * Sets the crossfade duration for track transitions.
+	 * When enabled, the current track's volume fades out over the specified duration
+	 * before the next track starts, creating a smooth audio transition.
+	 *
+	 * @param durationMs Crossfade duration in milliseconds (0 = disabled).
+	 * @example
+	 * ```ts
+	 * player.setCrossfade(5000); // 5-second crossfade
+	 * player.setCrossfade(0);    // Disable crossfade
+	 * ```
+	 */
+	public setCrossfade(durationMs: number): void {
+		if (durationMs < 0) throw new RangeError("Crossfade duration must be >= 0.");
+		this.crossfadeOptions = { duration: durationMs };
+		this.clearCrossfadeTimer();
+
+		if (durationMs > 0) {
+			this.startCrossfadeMonitor();
+		}
+
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Crossfade set to ${durationMs}ms`,
+		);
+	}
+
+	/** Returns the current crossfade duration in ms. */
+	public get crossfadeDuration(): number {
+		return this.crossfadeOptions.duration;
+	}
+
+	/**
+	 * Monitors track position and triggers volume fade-out when approaching track end.
+	 * @hidden
+	 */
+	private startCrossfadeMonitor(): void {
+		this.clearCrossfadeTimer();
+		if (this.crossfadeOptions.duration <= 0) return;
+
+		this.crossfadeTimer = setInterval(() => {
+			if (!this.playing || !this.queue.current) {
+				this.clearCrossfadeTimer();
+				return;
+			}
+
+			const trackDuration = this.queue.current.duration ?? 0;
+			if (trackDuration <= 0 || this.queue.current.isStream) return;
+
+			const remaining = trackDuration - this.position;
+			const fadeDuration = this.crossfadeOptions.duration;
+
+			if (remaining <= fadeDuration && remaining > 0 && this.queue.length > 0) {
+				this.clearCrossfadeTimer();
+				this.executeCrossfade(remaining);
+			}
+		}, 500);
+	}
+
+	/**
+	 * Executes the crossfade by gradually reducing volume.
+	 * @hidden
+	 */
+	private executeCrossfade(remainingMs: number): void {
+		const originalVolume = this.volume;
+		const steps = Math.max(5, Math.floor(remainingMs / 200));
+		const volumeStep = originalVolume / steps;
+		let currentStep = 0;
+
+		const nextTrack = this.queue[0];
+		if (nextTrack) {
+			this.manager.emit("CrossfadeStart", this, this.queue.current as Track, nextTrack);
+		}
+
+		const fadeInterval = setInterval(() => {
+			currentStep++;
+			const newVolume = Math.max(0, Math.round(originalVolume - (volumeStep * currentStep)));
+
+			this.node.rest.updatePlayer({
+				guildId: this.guild,
+				data: { volume: newVolume },
+			}).catch(() => {});
+
+			if (currentStep >= steps) {
+				clearInterval(fadeInterval);
+				// Restore volume for next track (will be applied on TrackStart)
+				this.volume = originalVolume;
+			}
+		}, Math.floor(remainingMs / steps));
+	}
+
+	/** Clears the crossfade monitor timer. @hidden */
+	private clearCrossfadeTimer(): void {
+		if (this.crossfadeTimer) {
+			clearInterval(this.crossfadeTimer);
+			this.crossfadeTimer = undefined;
+		}
+	}
+
+	// ── Auto-Ducking ─────────────────────────────────────────────────────
+
+	/**
+	 * Enables auto-ducking: reduces music volume temporarily.
+	 * Useful when TTS or voice announcements play over music.
+	 *
+	 * @param duckVolume The volume to duck to (0-100, default: 20).
+	 * @example
+	 * ```ts
+	 * player.duck(20);        // Duck to 20% volume
+	 * // ... TTS plays ...
+	 * player.unduck();         // Restore original volume
+	 * ```
+	 */
+	public async duck(duckVolume = 20): Promise<void> {
+		if (this.autoDuckActive) return;
+		this.preDuckVolume = this.volume;
+		this.autoDuckActive = true;
+		await this.node.rest.updatePlayer({
+			guildId: this.guild,
+			data: { volume: duckVolume },
+		});
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Auto-ducking: ${this.preDuckVolume} → ${duckVolume}`,
+		);
+	}
+
+	/**
+	 * Restores volume after auto-ducking.
+	 */
+	public async unduck(): Promise<void> {
+		if (!this.autoDuckActive) return;
+		this.autoDuckActive = false;
+		const restoreVolume = this.preDuckVolume || this.volume;
+		await this.node.rest.updatePlayer({
+			guildId: this.guild,
+			data: { volume: restoreVolume },
+		});
+		this.volume = restoreVolume;
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Auto-ducking restored to ${restoreVolume}`,
+		);
+	}
+
+	/** Whether the player is currently ducked. */
+	public get isDucked(): boolean {
+		return this.autoDuckActive;
+	}
+
+	// ── Buffer Duration ──────────────────────────────────────────────────
+
+	/**
+	 * Sets the buffer duration for the player's audio stream.
+	 * Higher values improve stability on bad networks but increase latency.
+	 * Requires Lavalink v4 with buffer support.
+	 *
+	 * @param durationMs Buffer duration in ms (default depends on Lavalink config).
+	 */
+	public async setBufferDuration(durationMs: number): Promise<void> {
+		if (durationMs < 0) throw new RangeError("Buffer duration must be >= 0.");
+		this.set("bufferDuration", durationMs);
+		this.manager.emit(
+			"Debug",
+			`[Player:${this.guild}] Buffer duration set to ${durationMs}ms`,
+		);
+	}
+
+	// ── State & Persistence ──────────────────────────────────────────────
 
 	/**
 	 * Returns a snapshot of the player's current state.

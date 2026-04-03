@@ -4,10 +4,94 @@
  * Derived from LithiumX — Copyright (c) 2025 Anantix Network (MIT)
  * See LICENSE and THIRD-PARTY-NOTICES.md for full license details.
  */
-import type { RestPlayOptions, Method, LavalinkResponse, LavalinkInfo, LoadType, TrackData, LavalinkVersion } from "./Types";
+import type { RestPlayOptions, Method, LavalinkResponse, LavalinkInfo, LoadType, TrackData, LavalinkVersion, SponsorBlockCategory, SponsorBlockSegment, RoutePlannerStatus, LavaSearchType } from "./Types";
 
 /** Maximum number of retries for rate-limited (429) requests. */
 const MAX_RATE_LIMIT_RETRIES = 3;
+
+// ── Token Bucket Rate Limiter ────────────────────────────────────────────
+
+/**
+ * Token bucket rate limiter for REST backpressure.
+ * Allows bursts up to `bucketSize` but sustains at `refillRate` tokens/sec.
+ * When the bucket is empty, requests wait in a FIFO queue.
+ */
+class TokenBucket {
+	private tokens: number;
+	private lastRefill: number;
+	private readonly queue: Array<() => void> = [];
+	private drainTimer?: ReturnType<typeof setTimeout>;
+
+	constructor(
+		private readonly bucketSize: number,
+		private readonly refillRate: number, // tokens per second
+	) {
+		this.tokens = bucketSize;
+		this.lastRefill = Date.now();
+	}
+
+	/** Refill tokens based on elapsed time since last refill. */
+	private refill(): void {
+		const now = Date.now();
+		const elapsed = (now - this.lastRefill) / 1000;
+		this.tokens = Math.min(this.bucketSize, this.tokens + elapsed * this.refillRate);
+		this.lastRefill = now;
+	}
+
+	/** Acquire a token. Resolves immediately if available, otherwise waits in queue. */
+	public acquire(): Promise<void> {
+		this.refill();
+
+		if (this.tokens >= 1) {
+			this.tokens -= 1;
+			return Promise.resolve();
+		}
+
+		return new Promise<void>((resolve) => {
+			this.queue.push(resolve);
+			this.scheduleDrain();
+		});
+	}
+
+	/** Schedule draining the wait queue as tokens become available. */
+	private scheduleDrain(): void {
+		if (this.drainTimer) return;
+		// Check every 1/refillRate seconds (when ~1 token is available)
+		const interval = Math.max(50, Math.ceil(1000 / this.refillRate));
+		this.drainTimer = setTimeout(() => {
+			this.drainTimer = undefined;
+			this.refill();
+
+			while (this.queue.length > 0 && this.tokens >= 1) {
+				this.tokens -= 1;
+				const resolve = this.queue.shift()!;
+				resolve();
+			}
+
+			if (this.queue.length > 0) {
+				this.scheduleDrain();
+			}
+		}, interval);
+	}
+
+	/** Returns the number of requests waiting in queue. */
+	public get pending(): number {
+		return this.queue.length;
+	}
+
+	/** Cleans up timers. */
+	public destroy(): void {
+		if (this.drainTimer) {
+			clearTimeout(this.drainTimer);
+			this.drainTimer = undefined;
+		}
+		// Resolve any waiting requests so they don't hang
+		while (this.queue.length > 0) {
+			const resolve = this.queue.shift()!;
+			resolve();
+		}
+	}
+}
 
 /**
  * Handles the requests sent to the Lavalink REST API.
@@ -32,6 +116,8 @@ class StellaRest {
 	public failedCount = 0;
 	/** Detected Lavalink version for protocol adaptation. */
 	private version: LavalinkVersion = 4;
+	/** Token bucket for REST backpressure (null = disabled). */
+	private rateLimiter: TokenBucket | null = null;
 
 	constructor(node: any) {
 		this.node = node;
@@ -39,6 +125,14 @@ class StellaRest {
 		this.password = node.options.password!;
 		this.baseUrl = `http${node.options.secure ? "s" : ""}://${node.options.host}:${node.options.port}`;
 		this.timeout = node.options.requestTimeout ?? 15000;
+
+		// Initialize backpressure rate limiter if configured
+		const bp = node.manager?.options?.restBackpressure;
+		if (bp?.enabled) {
+			const maxRps = bp.maxRequestsPerSecond ?? 20;
+			const bucket = bp.bucketSize ?? maxRps * 2;
+			this.rateLimiter = new TokenBucket(bucket, maxRps);
+		}
 	}
 
 	/** Sets the Lavalink version for protocol adaptation. */
@@ -269,6 +363,90 @@ class StellaRest {
 		return await this.delete(`/v4/sessions/${this.sessionId}/players/${guildId}`);
 	}
 
+	// ── SponsorBlock methods ────────────────────────────────────────────
+
+	/**
+	 * Get the current SponsorBlock categories for a player.
+	 * Requires the SponsorBlock Lavalink plugin.
+	 */
+	public async getSponsorBlock(guildId: string): Promise<SponsorBlockSegment[]> {
+		if (this.version === 3) return [];
+		return (await this.get(
+			`/v4/sessions/${this.sessionId}/players/${guildId}/sponsorblock/categories`,
+		)) as SponsorBlockSegment[];
+	}
+
+	/**
+	 * Set SponsorBlock categories to auto-skip for a player.
+	 * Requires the SponsorBlock Lavalink plugin.
+	 * @param guildId The guild ID.
+	 * @param categories Array of SponsorBlock categories to skip.
+	 */
+	public async setSponsorBlock(guildId: string, categories: SponsorBlockCategory[]): Promise<void> {
+		if (this.version === 3) return;
+		await this.request("PUT",
+			`/v4/sessions/${this.sessionId}/players/${guildId}/sponsorblock/categories`,
+			categories,
+		);
+	}
+
+	/**
+	 * Remove all SponsorBlock categories from a player.
+	 * Requires the SponsorBlock Lavalink plugin.
+	 */
+	public async deleteSponsorBlock(guildId: string): Promise<void> {
+		if (this.version === 3) return;
+		await this.delete(
+			`/v4/sessions/${this.sessionId}/players/${guildId}/sponsorblock/categories`,
+		);
+	}
+
+	// ── LavaSearch methods ─────────────────────────────────────────────
+
+	/**
+	 * Perform a structured search using the LavaSearch plugin.
+	 * Returns tracks, albums, artists, playlists, and text results.
+	 * Requires the LavaSearch Lavalink plugin.
+	 * @param query The search query (with source prefix, e.g. "ytsearch:query").
+	 * @param types Which result types to include.
+	 */
+	public async lavaSearch(query: string, types?: LavaSearchType[]): Promise<unknown> {
+		if (this.version === 3) return {};
+		let endpoint = `/v4/loadsearch?query=${encodeURIComponent(query)}`;
+		if (types?.length) {
+			endpoint += `&types=${types.join(",")}`;
+		}
+		return await this.get(endpoint);
+	}
+
+	// ── RoutePlanner methods ───────────────────────────────────────────
+
+	/**
+	 * Get the current RoutePlanner status.
+	 * Requires the RoutePlanner Lavalink plugin (NanoIP / RotatingPosty).
+	 */
+	public async getRoutePlannerStatus(): Promise<RoutePlannerStatus> {
+		const prefix = this.version === 3 ? "" : "/v4";
+		return (await this.get(`${prefix}/routeplanner/status`)) as RoutePlannerStatus;
+	}
+
+	/**
+	 * Free a specific failing address from the RoutePlanner.
+	 * @param address The IP address to unmark as failing.
+	 */
+	public async freeRoutePlannerAddress(address: string): Promise<void> {
+		const prefix = this.version === 3 ? "" : "/v4";
+		await this.post(`${prefix}/routeplanner/free/address`, { address });
+	}
+
+	/**
+	 * Free all failing addresses from the RoutePlanner.
+	 */
+	public async freeAllRoutePlannerAddresses(): Promise<void> {
+		const prefix = this.version === 3 ? "" : "/v4";
+		await this.post(`${prefix}/routeplanner/free/all`, {});
+	}
+
 	// ── Core HTTP methods ───────────────────────────────────────────────
 
 	/**
@@ -277,7 +455,23 @@ class StellaRest {
 	 * - Automatic retry on 429 (rate limit) with Retry-After
 	 * - Proper error wrapping
 	 */
+	/** Returns the number of requests waiting in the backpressure queue. */
+	public get pendingRequests(): number {
+		return this.rateLimiter?.pending ?? 0;
+	}
+
+	/** Cleans up the rate limiter. Called when the node is destroyed. */
+	public destroy(): void {
+		this.rateLimiter?.destroy();
+		this.rateLimiter = null;
+	}
+
 	private async request(method: Method, endpoint: string, body?: unknown, retryCount = 0): Promise<unknown> {
+		// Backpressure: wait for a token before sending
+		if (this.rateLimiter) {
+			await this.rateLimiter.acquire();
+		}
+
 		const url = `${this.baseUrl}${endpoint}`;
 		this.requestCount++;
 
@@ -379,6 +573,11 @@ class StellaRest {
 	/** Sends a POST request. */
 	public async post(endpoint: string, body: unknown): Promise<unknown> {
 		return await this.request("POST", endpoint, body);
+	}
+
+	/** Sends a PUT request. */
+	public async put(endpoint: string, body: unknown): Promise<unknown> {
+		return await this.request("PUT", endpoint, body);
 	}
 
 	/** Sends a DELETE request. */
