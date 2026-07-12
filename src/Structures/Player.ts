@@ -78,8 +78,11 @@ export class StellaPlayer {
 	public static readonly AUTOPLAY_HISTORY_MAX = 50;
 	/** Seed pool: last N tracks used for multi-seed smart mix recommendations. */
 	public autoplaySeedPool: { title: string; author: string; uri: string; duration: number; sourceName: string }[] = [];
-	/** Max seed pool size. */
-	public static readonly SEED_POOL_MAX = 5;
+
+	public autoplayDiscoveryMode: "radio" | "balanced" | "discovery" = "balanced";
+
+	public autoplaySkippedHistory: string[] = [];
+
 	/** Anchor track: the first track that started the current autoplay session. Used to prevent style drift. */
 	public autoplayAnchor: { title: string; author: string; uri: string; duration: number; sourceName: string } | null = null;
 	/** Whether the voice connection is ready. */
@@ -418,6 +421,9 @@ export class StellaPlayer {
 		// Clean up inactivity timer
 		this.stopInactivityTimer();
 
+		// Clean up crossfade timer
+		this.clearCrossfadeTimer();
+
 		// Clear pending voice resolvers
 		this.voiceReadyResolvers = [];
 		this.voiceReady = false;
@@ -527,7 +533,20 @@ export class StellaPlayer {
 			this.autoplayAnchor = null;
 			this.autoplaySeedPool = [];
 			this.autoplayHistory = [];
+			this.autoplaySkippedHistory = [];
 		}
+		return this;
+	}
+
+	/**
+	 * Sets the autoplay discovery mode.
+	 * @param mode The discovery mode.
+	 */
+	public setAutoplayDiscoveryMode(mode: "radio" | "balanced" | "discovery"): this {
+		if (!["radio", "balanced", "discovery"].includes(mode)) {
+			throw new TypeError("Autoplay discovery mode must be 'radio', 'balanced', or 'discovery'.");
+		}
+		this.autoplayDiscoveryMode = mode;
 		return this;
 	}
 
@@ -1129,6 +1148,8 @@ export class StellaPlayer {
 			botUserId,
 			autoplayHistory: this.autoplayHistory,
 			autoplaySeedPool: [...this.autoplaySeedPool],
+			autoplayDiscoveryMode: this.autoplayDiscoveryMode,
+			autoplaySkippedHistory: this.autoplaySkippedHistory,
 			queue: this.queue.map((t) => StellaPlayer.trackToPersist(t)),
 			filters: {
 				distortion: this.filters.distortion,
@@ -1162,6 +1183,8 @@ export class StellaPlayer {
 		// Restore autoplay history and seed pool
 		this.autoplayHistory = state.autoplayHistory ?? [];
 		this.autoplaySeedPool = state.autoplaySeedPool ?? [];
+		this.autoplayDiscoveryMode = state.autoplayDiscoveryMode ?? "balanced";
+		this.autoplaySkippedHistory = state.autoplaySkippedHistory ?? [];
 
 		// Restore repeat modes
 		this.trackRepeat = state.trackRepeat;

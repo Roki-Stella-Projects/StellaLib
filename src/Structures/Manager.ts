@@ -43,6 +43,41 @@ import { LRUCache } from "./LRUCache";
 import { TypedEmitter } from "tiny-typed-emitter";
 import managerCheck from "../Utils/ManagerCheck";
 
+export class Collection<K, V> extends Map<K, V> {
+	public map<T>(fn: (value: V, key: K, collection: this) => T): T[] {
+		const arr: T[] = [];
+		for (const [key, val] of this.entries()) {
+			arr.push(fn(val, key, this));
+		}
+		return arr;
+	}
+
+	public filter(fn: (value: V, key: K, collection: this) => boolean): this {
+		const coll = new (this.constructor as any)() as this;
+		for (const [key, val] of this.entries()) {
+			if (fn(val, key, this)) coll.set(key, val);
+		}
+		return coll;
+	}
+
+	public reduce<T>(
+		fn: (accumulator: T, value: V, key: K, collection: this) => T,
+		initialValue?: T,
+	): T {
+		let accumulator = initialValue;
+		let first = true;
+		for (const [key, val] of this.entries()) {
+			if (first && accumulator === undefined) {
+				accumulator = val as any;
+				first = false;
+				continue;
+			}
+			accumulator = fn(accumulator!, val, key, this);
+		}
+		return accumulator!;
+	}
+}
+
 /**
  * The main hub for interacting with Lavalink using StellaLib.
  */
@@ -60,9 +95,9 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 	};
 
 	/** The map of players. */
-	public readonly players = new Map<string, StellaPlayer>();
+	public readonly players = new Collection<string, StellaPlayer>();
 	/** The map of nodes. */
-	public readonly nodes = new Map<string, StellaNode>();
+	public readonly nodes = new Collection<string, StellaNode>();
 	/** The options that were set. */
 	public readonly options: ManagerOptions;
 	private initiated = false;

@@ -11,6 +11,7 @@ import {
 	trebleBassEqualizer,
 	tvEqualizer,
 	vaporwaveEqualizer,
+	crystalClearEqualizer,
 } from "../Utils/FiltersEqualizers";
 class Filters {
 	public distortion: DistortionOptions | null;
@@ -45,6 +46,7 @@ class Filters {
 			trebleBass: false,
 			tv: false,
 			vaporwave: false,
+			hifi: false,
 		};
 	}
 
@@ -265,6 +267,19 @@ class Filters {
 	}
 
 	/**
+	 * Set the high-fidelity pure audio effect.
+	 * Optimizes equalizer bands for maximum clarity, rich sub-bass, and details.
+	 * @param status Whether to enable or disable.
+	 */
+	public setHifi(status: boolean): this {
+		if (status) {
+			return this.setEqualizer(crystalClearEqualizer).setFilterStatus("hifi", status);
+		} else {
+			return this.setEqualizer([]).setFilterStatus("hifi", status);
+		}
+	}
+
+	/**
 	 * Set a filter by name.
 	 * @param filter The filter name.
 	 * @param status Whether to enable or disable.
@@ -282,6 +297,7 @@ class Filters {
 			case "trebleBass": this.setTrebleBass(status); break;
 			case "tv": this.setTV(status); break;
 			case "vaporwave": this.setVaporwave(status); break;
+			case "hifi": this.setHifi(status); break;
 			default: throw new Error(`Invalid filter: "${filter}"`);
 		}
 
@@ -303,6 +319,7 @@ class Filters {
 			trebleBass: false,
 			tv: false,
 			vaporwave: false,
+			hifi: false,
 		};
 
 		this.distortion = null;
@@ -407,6 +424,7 @@ interface AvailableFilters {
 	trebleBass: boolean;
 	tv: boolean;
 	vaporwave: boolean;
+	hifi: boolean;
 }
 
 export {

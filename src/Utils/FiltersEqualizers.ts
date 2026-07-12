@@ -99,4 +99,22 @@ const vaporwaveEqualizer: Band[] = [
 	{ band: 13, gain: 0.15 },
 ];
 
-export { Band, bassBoostEqualizer, softEqualizer, tvEqualizer, trebleBassEqualizer, vaporwaveEqualizer };
+const crystalClearEqualizer: Band[] = [
+	{ band: 0, gain: 0.15 },  // Sub-bass boost
+	{ band: 1, gain: 0.1 },   // Bass boost
+	{ band: 2, gain: 0.05 },  // Warmth
+	{ band: 3, gain: 0.0 },
+	{ band: 4, gain: -0.05 }, // Mud reduction
+	{ band: 5, gain: -0.1 },  // Mud reduction
+	{ band: 6, gain: -0.05 },
+	{ band: 7, gain: 0.0 },
+	{ band: 8, gain: 0.05 },  // High mid detail
+	{ band: 9, gain: 0.1 },   // Presence
+	{ band: 10, gain: 0.15 }, // Clarity
+	{ band: 11, gain: 0.2 },  // Vocal brightness
+	{ band: 12, gain: 0.15 }, // High treble crispness
+	{ band: 13, gain: 0.1 },  // Airiness
+	{ band: 14, gain: 0.15 }, // Airiness
+];
+
+export { Band, bassBoostEqualizer, softEqualizer, tvEqualizer, trebleBassEqualizer, vaporwaveEqualizer, crystalClearEqualizer };

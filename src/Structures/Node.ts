@@ -410,6 +410,7 @@ class StellaNode {
 	 * Jitter prevents thundering herd when multiple nodes reconnect simultaneously.
 	 */
 	private reconnect(): void {
+		if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
 		const baseDelay = this.options.retryDelay ?? 60000;
 		const maxDelay = 120000;
 
@@ -898,6 +899,28 @@ class StellaNode {
 	protected async trackEnd(player: StellaPlayer, track: Track, payload: TrackEndEvent): Promise<void> {
 		const { reason } = payload;
 
+		// Quick-Skip Detection:
+		if (reason === "replaced" || reason === "stopped") {
+			const playedDuration = player.position;
+			const trackDuration = track?.duration ?? 0;
+			if (trackDuration > 30_000 && playedDuration < 20_000) {
+				const skipKey = `${normalizeText(track.title ?? "")}::${normalizeAuthor(track.author ?? "")}`;
+				if (!player.autoplaySkippedHistory) {
+					player.autoplaySkippedHistory = [];
+				}
+				if (!player.autoplaySkippedHistory.includes(skipKey)) {
+					player.autoplaySkippedHistory.push(skipKey);
+					if (player.autoplaySkippedHistory.length > 20) {
+						player.autoplaySkippedHistory.shift();
+					}
+				}
+				this.manager.emit(
+					"Debug",
+					`[Player:${player.guild}] Quick-skip detected for "${track.title}" by "${track.author}" (played ${Math.round(playedDuration / 1000)}s). Added to blacklist.`,
+				);
+			}
+		}
+
 		if (["loadFailed", "cleanup"].includes(reason)) {
 			this.handleFailedTrack(player, track, payload);
 		} else if (reason === "replaced") {
@@ -962,62 +985,62 @@ class StellaNode {
 		const anchor = player.autoplayAnchor;
 		const avgDuration = seedPool.reduce((sum, s) => sum + s.duration, 0) / (seedPool.length || 1);
 
+		// ── Precompute script and style profiles of the seed pool ───────────
+		const seedHasCJK = seedPool.some(s => /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF\uAC00-\uD7AF]/.test((s.title ?? "") + " " + (s.author ?? "")));
+		const seedHasCyrillic = seedPool.some(s => /[\u0400-\u04FF]/.test((s.title ?? "") + " " + (s.author ?? "")));
+		const seedHasThai = seedPool.some(s => /[\u0E00-\u0E7F]/.test((s.title ?? "") + " " + (s.author ?? "")));
+		const seedHasArabic = seedPool.some(s => /[\u0600-\u06FF]/.test((s.title ?? "") + " " + (s.author ?? "")));
+		const seedHasDevanagari = seedPool.some(s => /[\u0900-\u097F]/.test((s.title ?? "") + " " + (s.author ?? "")));
+
+		const seedStyles = new Set<string>();
+		for (const seed of seedPool) {
+			const styles = getStyleProfile(seed.title ?? "");
+			for (const s of styles) seedStyles.add(s);
+		}
+
 		// ── Transition scoring engine ───────────────────────────────────────
 		const scoreTrack = (candidate: Track): number => {
 			let score = 0;
 
-			// Duration similarity: ±30s = +40, ±60s = +25, ±120s = +10
+			// Duration similarity: ±30s = +20, ±60s = +12, ±120s = +5
 			const durDiff = Math.abs((candidate.duration ?? 0) - avgDuration);
-			if (durDiff < 30_000) score += 40;
-			else if (durDiff < 60_000) score += 25;
-			else if (durDiff < 120_000) score += 10;
+			if (durDiff < 30_000) score += 20;
+			else if (durDiff < 60_000) score += 12;
+			else if (durDiff < 120_000) score += 5;
 
 			const candAuthor = (candidate.author ?? "").toLowerCase();
 			const candTitle = (candidate.title ?? "").toLowerCase();
-			const candTitleWords = candTitle.split(/[\s\-_()[\]]+/).filter((w) => w.length > 2);
+			const normCandAuthor = normalizeAuthor(candidate.author ?? "");
+			const normCandTitle = normalizeText(candidate.title ?? "");
+			const candTitleWords = normCandTitle.split(/\s+/).filter((w) => w.length > 2);
 
-			// Author match against previous track
-			const prevAuthor = (previousTrack.author ?? "").toLowerCase();
-			if (prevAuthor && candAuthor) {
-				if (candAuthor === prevAuthor) {
-					score += 30;
-				} else {
-					// Partial word overlap (e.g. "Silo" in "Silo Music")
-					const prevWords = prevAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
-					const cWords = candAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
-					const overlap = prevWords.filter((w) => cWords.includes(w)).length;
-					score += Math.min(overlap * 10, 20);
-				}
-			}
-
-			// Title keyword overlap (shared theme/vibe/language)
-			const prevTitle = (previousTrack.title ?? "").toLowerCase();
-			if (prevTitle) {
-				const prevWords = prevTitle.split(/[\s\-_()[\]]+/).filter((w) => w.length > 2);
+			// Title keyword overlap with previous track (shared theme/vibe/language)
+			const normPrevTitle = normalizeText(previousTrack.title ?? "");
+			if (normPrevTitle) {
+				const prevWords = normPrevTitle.split(/\s+/).filter((w) => w.length > 2);
 				const overlap = prevWords.filter((w) => candTitleWords.includes(w)).length;
-				score += Math.min(overlap * 8, 24);
+				score += Math.min(overlap * 10, 30);
 			}
 
-			// ── Anchor similarity (prevents style drift from the user's original pick) ──
+			// Anchor similarity (prevents style drift from the user's original pick)
 			if (anchor) {
-				const anchorAuthor = anchor.author.toLowerCase();
-				const anchorTitle = anchor.title.toLowerCase();
+				const normAnchorAuthor = normalizeAuthor(anchor.author ?? "");
+				const normAnchorTitle = normalizeText(anchor.title ?? "");
 				// Author match to anchor
-				if (candAuthor && anchorAuthor) {
-					if (candAuthor === anchorAuthor) {
-						score += 25;
+				if (normCandAuthor && normAnchorAuthor) {
+					if (normCandAuthor === normAnchorAuthor) {
+						score += 20;
 					} else {
-						const anchorWords = anchorAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
-						const cWords = candAuthor.split(/[\s,&]+/).filter((w) => w.length > 2);
-						const overlap = anchorWords.filter((w) => cWords.includes(w)).length;
-						score += Math.min(overlap * 8, 16);
+						const anchorWords = normAnchorAuthor.split(/\s+/).filter((w) => w.length > 2);
+						const overlap = anchorWords.filter((w) => normCandAuthor.includes(w) || normCandAuthor.split(/\s+/).includes(w)).length;
+						score += Math.min(overlap * 6, 12);
 					}
 				}
 				// Title keyword overlap with anchor
-				if (anchorTitle) {
-					const anchorTitleWords = anchorTitle.split(/[\s\-_()[\]]+/).filter((w) => w.length > 2);
+				if (normAnchorTitle) {
+					const anchorTitleWords = normAnchorTitle.split(/\s+/).filter((w) => w.length > 2);
 					const overlap = anchorTitleWords.filter((w) => candTitleWords.includes(w)).length;
-					score += Math.min(overlap * 6, 18);
+					score += Math.min(overlap * 8, 20);
 				}
 				// Source match to anchor (keep same platform as original)
 				if (candidate.sourceName === anchor.sourceName) {
@@ -1025,23 +1048,15 @@ class StellaNode {
 				}
 			}
 
-			// ── Seed-pool-wide author affinity ──────────────────────────────
-			// Bonus if candidate's author appears anywhere in recent seeds
-			if (candAuthor) {
-				const seedAuthorMatches = seedPool.filter((s) => s.author.toLowerCase() === candAuthor).length;
-				if (seedAuthorMatches > 0) score += Math.min(seedAuthorMatches * 8, 16);
+			// Seed-pool-wide author affinity & diversity
+			if (normCandAuthor) {
+				const seedAuthorMatches = seedPool.filter((s) => normalizeAuthor(s.author ?? "") === normCandAuthor).length;
+				if (seedAuthorMatches > 0) {
+					score += Math.min(seedAuthorMatches * 8, 16);
+				}
 			}
 
-			// Seed pool diversity bonus: avoid same author for 3+ tracks in a row
-			const recentAuthors = seedPool.slice(-3).map((s) => s.author.toLowerCase());
-			const authorRepeatCount = recentAuthors.filter((a) => a === candAuthor).length;
-			if (authorRepeatCount === 0 && candAuthor !== prevAuthor) {
-				score += 15; // Diversity bonus — fresh artist
-			} else if (authorRepeatCount >= 2) {
-				score -= 20; // Penalty — too repetitive
-			}
-
-			// Source consistency: prefer same platform for smoother vibe
+			// Source consistency
 			if (candidate.sourceName === previousTrack.sourceName) {
 				score += 5;
 			}
@@ -1053,18 +1068,127 @@ class StellaNode {
 			const dur = candidate.duration ?? 0;
 			if (dur > 60_000 && dur < 480_000) score += 10;
 
+			// Language/Script Consistency
+			const candText = candTitle + " " + candAuthor;
+			const candCJK = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF\uAC00-\uD7AF]/.test(candText);
+			const candCyrillic = /[\u0400-\u04FF]/.test(candText);
+			const candThai = /[\u0E00-\u0E7F]/.test(candText);
+			const candArabic = /[\u0600-\u06FF]/.test(candText);
+			const candDevanagari = /[\u0900-\u097F]/.test(candText);
+
+			if (candCJK && !seedHasCJK) score -= 60;
+			if (candCyrillic && !seedHasCyrillic) score -= 60;
+			if (candThai && !seedHasThai) score -= 60;
+			if (candArabic && !seedHasArabic) score -= 60;
+			if (candDevanagari && !seedHasDevanagari) score -= 60;
+
+			if (candCJK && seedHasCJK) score += 30;
+			if (candCyrillic && seedHasCyrillic) score += 30;
+			if (candThai && seedHasThai) score += 30;
+			if (candArabic && seedHasArabic) score += 30;
+			if (candDevanagari && seedHasDevanagari) score += 30;
+
+			// Discovery Mode Specific Adjustments
+			const discoveryMode = player.autoplayDiscoveryMode ?? "balanced";
+			const recentAuthors = seedPool.slice(-3).map((s) => normalizeAuthor(s.author ?? ""));
+			const normPrevAuthor = normalizeAuthor(previousTrack.author ?? "");
+			const authorRepeatCount = recentAuthors.filter((a) => a === normCandAuthor).length;
+
+			if (discoveryMode === "radio") {
+				// Strongly favor same artist, no diversity penalties
+				if (normCandAuthor === normPrevAuthor) {
+					score += 35;
+				}
+				// Penalize style changes heavily
+				const candStyles = getStyleProfile(candidate.title ?? "");
+				for (const cs of candStyles) {
+					if (!seedStyles.has(cs)) {
+						score -= 50;
+					} else {
+						score += 15;
+					}
+				}
+			} else if (discoveryMode === "discovery") {
+				// Penalize same artist, reward fresh ones
+				if (normCandAuthor === normPrevAuthor) {
+					score -= 20;
+				}
+				if (authorRepeatCount === 0 && normCandAuthor !== normPrevAuthor) {
+					score += 35; // Discovery bonus — fresh artist
+				} else if (authorRepeatCount === 1) {
+					score -= 20;
+				} else if (authorRepeatCount >= 2) {
+					score -= 60; // Strong penalty — too repetitive
+				}
+				// Mild style shifts are allowed
+				const candStyles = getStyleProfile(candidate.title ?? "");
+				for (const cs of candStyles) {
+					if (!seedStyles.has(cs)) {
+						score -= 15;
+					} else {
+						score += 25;
+					}
+				}
+			} else {
+				// balanced (default)
+				if (normPrevAuthor && normCandAuthor) {
+					if (normCandAuthor === normPrevAuthor) {
+						score += 25;
+					} else {
+						const prevWords = normPrevAuthor.split(/\s+/).filter((w) => w.length > 2);
+						const overlap = prevWords.filter((w) => normCandAuthor.includes(w) || normCandAuthor.split(/\s+/).includes(w)).length;
+						score += Math.min(overlap * 8, 16);
+					}
+				}
+				if (authorRepeatCount === 0 && normCandAuthor !== normPrevAuthor) {
+					score += 15;
+				} else if (authorRepeatCount >= 2) {
+					score -= 25;
+				}
+				// Style/Vibe Consistency
+				const candStyles = getStyleProfile(candidate.title ?? "");
+				for (const cs of candStyles) {
+					if (!seedStyles.has(cs)) {
+						if (["lofi", "phonk", "nightcore", "sped up", "speed up", "slowed", "reverb", "instrumental", "cover"].includes(cs)) {
+							score -= 40;
+						} else {
+							score -= 15;
+						}
+					} else {
+						score += 25;
+					}
+				}
+			}
+
 			return score;
 		};
 
 		// Helper: filter out history + current/previous, score & rank, return best
 		const pickBestTransition = (tracks: Track[]): Track | undefined => {
-			const eligible = tracks.filter(
-				(t) =>
-					t.uri !== previousTrack.uri &&
-					t.uri !== track.uri &&
-					!historySet.has(t.uri) &&
-					!historySet.has(`${t.title}::${t.author}`),
-			);
+			const eligible = tracks.filter((t) => {
+				if (t.uri === previousTrack.uri || t.uri === track.uri) return false;
+				if (historySet.has(t.uri)) return false;
+
+				const normCandTitle = normalizeText(t.title ?? "");
+				const normCandAuthor = normalizeAuthor(t.author ?? "");
+				const titleAuthorKey = `${normCandTitle}::${normCandAuthor}`;
+
+				if (historySet.has(titleAuthorKey)) return false;
+
+				// Exclude quick-skipped tracks
+				const isQuickSkipped = player.autoplaySkippedHistory?.includes(titleAuthorKey);
+				if (isQuickSkipped) return false;
+
+				// Avoid playing tracks currently in the seed pool
+				const inSeedPool = seedPool.some(s => {
+					const sTitle = normalizeText(s.title ?? "");
+					const sAuthor = normalizeAuthor(s.author ?? "");
+					return `${sTitle}::${sAuthor}` === titleAuthorKey;
+				});
+				if (inSeedPool) return false;
+
+				return true;
+			});
 			if (!eligible.length) return undefined;
 
 			const scored = eligible.map((t) => ({ track: t, score: scoreTrack(t) }));
@@ -1084,25 +1208,34 @@ class StellaNode {
 
 		// Helper: add track to history (bounded ring buffer — dedup by URI and title+author)
 		const addToHistory = (t: Track): void => {
-			const key = t.uri || `${t.title}::${t.author}`;
-			if (key && !historySet.has(key)) {
-				player.autoplayHistory.push(key);
-				historySet.add(key);
-				if (player.autoplayHistory.length > 50) {
-					const removed = player.autoplayHistory.splice(0, player.autoplayHistory.length - 50);
-					for (const r of removed) historySet.delete(r);
-				}
+			const uriKey = t.uri;
+			const titleAuthorKey = `${normalizeText(t.title ?? "")}::${normalizeAuthor(t.author ?? "")}`;
+			if (uriKey && !historySet.has(uriKey)) {
+				player.autoplayHistory.push(uriKey);
+				historySet.add(uriKey);
+			}
+			if (!historySet.has(titleAuthorKey)) {
+				player.autoplayHistory.push(titleAuthorKey);
+				historySet.add(titleAuthorKey);
+			}
+			if (player.autoplayHistory.length > 50) {
+				const removed = player.autoplayHistory.splice(0, player.autoplayHistory.length - 50);
+				for (const r of removed) historySet.delete(r);
 			}
 		};
 
 		// Helper: search → score → return best transition
-		const tryMixSearch = async (query: string | { source: string; query: string }): Promise<Track | undefined> => {
+		const tryMixSearch = async (query: string | { source: string; query: string }, minScoreThreshold = -Infinity): Promise<Track | undefined> => {
 			try {
 				const res = await player.search(query as any, requester);
 				if (res.loadType === "empty" || res.loadType === "error") return undefined;
 				let tracks = res.tracks;
 				if (res.loadType === "playlist" && res.playlist) tracks = res.playlist.tracks;
-				return pickBestTransition(tracks);
+				const picked = pickBestTransition(tracks);
+				if (picked && scoreTrack(picked) >= minScoreThreshold) {
+					return picked;
+				}
+				return undefined;
 			} catch {
 				return undefined;
 			}
@@ -1127,186 +1260,200 @@ class StellaNode {
 			`[AutoMix] Finding best transition (from: "${previousTrack.title}" by "${previousTrack.author}", avgDur: ${Math.round(avgDuration / 1000)}s, seeds: ${seedPool.length})`,
 		);
 
-		// ── Strategy 1: Spotify Recommendations (multi-seed) ────────────────
-		if (this.info?.sourceManagers?.includes("spotify")) {
-			try {
-				// Build multi-seed from seed pool (up to 5 seed tracks)
-				const spotifySeeds = seedPool
-					.filter((s) => s.uri?.includes("spotify.com"))
-					.map((s) => this.extractSpotifyTrackID(s.uri))
-					.filter(Boolean);
+		const runAutoplaySelection = async (minScore: number): Promise<boolean> => {
+			// ── Strategy 1: Spotify Recommendations (multi-seed) ────────────────
+			if (this.info?.sourceManagers?.includes("spotify")) {
+				try {
+					// Build multi-seed from seed pool (up to 5 seed tracks)
+					const spotifySeeds = seedPool
+						.filter((s) => s.uri?.includes("spotify.com"))
+						.map((s) => this.extractSpotifyTrackID(s.uri))
+						.filter(Boolean);
 
-				const artistID = previousTrack.pluginInfo?.artistUrl
-					? this.extractSpotifyArtistID(previousTrack.pluginInfo.artistUrl)
-					: null;
+					const artistID = previousTrack.pluginInfo?.artistUrl
+						? this.extractSpotifyArtistID(previousTrack.pluginInfo.artistUrl)
+						: null;
 
-				let identifier = "";
-				if (spotifySeeds.length > 0) {
-					const seedTracks = spotifySeeds.slice(-3).join(",");
-					identifier = artistID
-						? `sprec:seed_artists=${artistID}&seed_tracks=${seedTracks}`
-						: `sprec:seed_tracks=${seedTracks}`;
-				} else if (previousTrack.uri?.includes("spotify.com")) {
-					const trackID = this.extractSpotifyTrackID(previousTrack.uri);
-					if (trackID) {
+					let identifier = "";
+					if (spotifySeeds.length > 0) {
+						const seedTracks = spotifySeeds.slice(-3).join(",");
 						identifier = artistID
-							? `sprec:seed_artists=${artistID}&seed_tracks=${trackID}`
-							: `sprec:seed_tracks=${trackID}`;
+							? `sprec:seed_artists=${artistID}&seed_tracks=${seedTracks}`
+							: `sprec:seed_tracks=${seedTracks}`;
+					} else if (previousTrack.uri?.includes("spotify.com")) {
+						const trackID = this.extractSpotifyTrackID(previousTrack.uri);
+						if (trackID) {
+							identifier = artistID
+								? `sprec:seed_artists=${artistID}&seed_tracks=${trackID}`
+								: `sprec:seed_tracks=${trackID}`;
+						}
 					}
-				}
 
-				if (identifier) {
-					const recResult = await this.rest.loadTracks(identifier);
+					if (identifier) {
+						const recResult = await this.rest.loadTracks(identifier);
 
-					if (recResult.loadType === "playlist") {
-						const playlistData = recResult.data as PlaylistRawData;
-						const candidates = playlistData.tracks.map((t) => TrackUtils.build(t, requester));
-						const picked = pickBestTransition(candidates);
-						if (picked) {
-							// Try playing the Spotify rec directly first (if source supports it)
-							if (picked.track && picked.uri) {
-								commitTrack(picked, "Spotify rec (direct)");
-								return;
-							}
-							// Fallback: re-search on SoundCloud for a streamable version
-							const streamable = await tryMixSearch({ source: "soundcloud", query: `${picked.author} ${picked.title}` });
-							if (streamable) {
-								commitTrack(streamable, "Spotify rec → SoundCloud");
-								return;
-							}
-							// Fallback: try YouTube
-							const ytFallback = await tryMixSearch({ source: "youtube", query: `${picked.author} ${picked.title}` });
-							if (ytFallback) {
-								commitTrack(ytFallback, "Spotify rec → YouTube");
-								return;
+						if (recResult.loadType === "playlist") {
+							const playlistData = recResult.data as PlaylistRawData;
+							const candidates = playlistData.tracks.map((t) => TrackUtils.build(t, requester));
+							const picked = pickBestTransition(candidates);
+							if (picked && scoreTrack(picked) >= minScore) {
+								// Try playing the Spotify rec directly first (if source supports it)
+								if (picked.track && picked.uri) {
+									commitTrack(picked, "Spotify rec (direct)");
+									return true;
+								}
+								// Fallback: re-search on SoundCloud for a streamable version
+								const streamable = await tryMixSearch({ source: "soundcloud", query: `${picked.author} ${picked.title}` }, minScore);
+								if (streamable) {
+									commitTrack(streamable, "Spotify rec → SoundCloud");
+									return true;
+								}
+								// Fallback: try YouTube
+								const ytFallback = await tryMixSearch({ source: "youtube", query: `${picked.author} ${picked.title}` }, minScore);
+								if (ytFallback) {
+									commitTrack(ytFallback, "Spotify rec → YouTube");
+									return true;
+								}
 							}
 						}
 					}
+				} catch {
+					// Fall through
 				}
-			} catch {
-				// Fall through
 			}
-		}
 
-		// ── Strategy 2: Author-based mix ────────────────────────────────────
-		// Build diverse search queries from the seed pool to keep the mix flowing
-		if (previousTrack.author) {
-			const uniqueAuthors = [...new Set(seedPool.map((s) => s.author).filter(Boolean))];
+			// ── Strategy 2: Author-based mix ────────────────────────────────────
+			// Build diverse search queries from the seed pool to keep the mix flowing
+			if (previousTrack.author) {
+				const uniqueAuthors = [...new Set(seedPool.map((s) => s.author).filter(Boolean))];
 
-			// Extract meaningful title keywords (skip noise words) for search context
-			const titleKeywords = (previousTrack.title ?? "")
-				.split(/[\s\-_()[\],.'"!?]+/)
-				.filter((w) => w.length > 2 && !/^(feat|ft|remix|version|official|video|audio|lyrics|mv|hd|hq|high|school|the|and|for)$/i.test(w))
-				.slice(0, 3)
-				.join(" ");
+				// Extract meaningful title keywords (skip noise words) for search context
+				const titleKeywords = (previousTrack.title ?? "")
+					.split(/[\s\-_()[\],.'"!?]+/)
+					.filter((w) => w.length > 2 && !/^(feat|ft|remix|version|official|video|audio|lyrics|mv|hd|hq|high|school|the|and|for)$/i.test(w))
+					.slice(0, 3)
+					.join(" ");
 
-			// Determine if author name is too short/generic for a standalone search
-			// Strip punctuation/symbols to measure actual content length
-			const strippedAuthor = previousTrack.author.replace(/[^\p{L}\p{N}]/gu, "");
-			const isShortAuthor = strippedAuthor.length <= 5;
+				// Determine if author name is too short/generic for a standalone search
+				// Strip punctuation/symbols to measure actual content length
+				const strippedAuthor = previousTrack.author.replace(/[^\p{L}\p{N}]/gu, "");
+				const isShortAuthor = strippedAuthor.length <= 5;
 
-			const searchQueries: { source: string; query: string }[] = [];
+				const searchQueries: { source: string; query: string }[] = [];
 
-			// Always try author + title keywords first — most targeted, avoids generic name pollution
-			if (titleKeywords) {
-				searchQueries.push({ source: "soundcloud", query: `${previousTrack.author} ${titleKeywords}` });
-			}
-			// Only use bare author name if it's long/unique enough to be a meaningful search term
-			if (!isShortAuthor) {
-				searchQueries.push({ source: "soundcloud", query: previousTrack.author });
-			}
-			// Cross-artist from seed pool (also with title context for short names)
-			if (uniqueAuthors.length > 1) {
-				const altAuthor = uniqueAuthors.find((a) => a !== previousTrack.author);
-				if (altAuthor) {
-					const altStripped = altAuthor.replace(/[^\p{L}\p{N}]/gu, "");
-					if (altStripped.length > 5) {
-						searchQueries.push({ source: "soundcloud", query: altAuthor });
-					} else if (titleKeywords) {
-						searchQueries.push({ source: "soundcloud", query: `${altAuthor} ${titleKeywords}` });
+				// Always try author + title keywords first — most targeted, avoids generic name pollution
+				if (titleKeywords) {
+					searchQueries.push({ source: "soundcloud", query: `${previousTrack.author} ${titleKeywords}` });
+				}
+				// Only use bare author name if it's long/unique enough to be a meaningful search term
+				if (!isShortAuthor) {
+					searchQueries.push({ source: "soundcloud", query: previousTrack.author });
+				}
+				// Cross-artist from seed pool (also with title context for short names)
+				if (uniqueAuthors.length > 1) {
+					const altAuthor = uniqueAuthors.find((a) => a !== previousTrack.author);
+					if (altAuthor) {
+						const altStripped = altAuthor.replace(/[^\p{L}\p{N}]/gu, "");
+						if (altStripped.length > 5) {
+							searchQueries.push({ source: "soundcloud", query: altAuthor });
+						} else if (titleKeywords) {
+							searchQueries.push({ source: "soundcloud", query: `${altAuthor} ${titleKeywords}` });
+						}
+					}
+				}
+				// YouTube fallback
+				searchQueries.push({ source: "youtube", query: `${previousTrack.author} ${titleKeywords || "music"}` });
+
+				for (const sq of searchQueries) {
+					const found = await tryMixSearch(sq, minScore);
+					if (found) {
+						commitTrack(found, `author mix on ${sq.source}`);
+						return true;
 					}
 				}
 			}
-			// YouTube fallback
-			searchQueries.push({ source: "youtube", query: `${previousTrack.author} ${titleKeywords || "music"}` });
 
-			for (const sq of searchQueries) {
-				const found = await tryMixSearch(sq);
-				if (found) {
-					commitTrack(found, `author mix on ${sq.source}`);
-					return;
+			// ── Strategy 3: Title/theme-based mix ───────────────────────────────
+			// Extract theme keywords from seed pool for broader but on-theme results
+			if (previousTrack.title) {
+				const allTitles = seedPool.map((s) => s.title).join(" ");
+				const keywords = allTitles
+					.toLowerCase()
+					.split(/[\s\-_()[\],]+/)
+					.filter((w) => w.length > 3)
+					.reduce((acc, w) => { acc.set(w, (acc.get(w) ?? 0) + 1); return acc; }, new Map<string, number>());
+
+				// Get the most common theme words from recent tracks
+				const themeWords = [...keywords.entries()]
+					.sort((a, b) => b[1] - a[1])
+					.slice(0, 3)
+					.map(([w]) => w)
+					.join(" ");
+
+				const searchQueries = [
+					{ source: "soundcloud", query: `${previousTrack.author} ${previousTrack.title}` },
+					{ source: "soundcloud", query: previousTrack.title },
+					...(themeWords ? [{ source: "soundcloud", query: themeWords }] : []),
+					{ source: "youtube", query: `${previousTrack.title} ${previousTrack.author}` },
+				];
+
+				for (const sq of searchQueries) {
+					const found = await tryMixSearch(sq, minScore);
+					if (found) {
+						commitTrack(found, `theme mix on ${sq.source}`);
+						return true;
+					}
 				}
 			}
+
+			// ── Strategy 4: YouTube Radio Mix (last resort) ─────────────────────
+			const hasYouTubeURL = ["youtube.com", "youtu.be"].some((url) =>
+				previousTrack.uri?.includes(url),
+			);
+			if (hasYouTubeURL) {
+				// Robust YouTube video ID extraction (handles /watch?v=ID, /shorts/ID, youtu.be/ID)
+				let videoID: string | null = null;
+				try {
+					const url = new URL(previousTrack.uri!);
+					if (url.hostname === "youtu.be") {
+						videoID = url.pathname.slice(1).split("/")[0] || null;
+					} else {
+						videoID = url.searchParams.get("v") ?? url.pathname.split("/").pop() ?? null;
+					}
+				} catch {
+					// Fallback regex for malformed URIs
+					const match = previousTrack.uri?.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+					videoID = match ? match[1] : null;
+				}
+
+				if (videoID && videoID.length >= 10) {
+					const randomIndex = Math.floor(Math.random() * 23) + 2;
+					const mixURI = `https://www.youtube.com/watch?v=${videoID}&list=RD${videoID}&index=${randomIndex}`;
+					const found = await tryMixSearch(mixURI, minScore);
+					if (found) {
+						commitTrack(found, "YouTube radio mix");
+						return true;
+					}
+				}
+			}
+
+			return false;
+		};
+
+		// Try with quality threshold first to avoid style/language drift
+		let foundAndPlayed = await runAutoplaySelection(-10);
+		if (!foundAndPlayed) {
+			this.manager.emit("Debug", `[AutoMix] No candidate met quality threshold (-10), retrying without threshold.`);
+			// Fallback to any eligible track if quality threshold was too strict
+			foundAndPlayed = await runAutoplaySelection(-Infinity);
 		}
 
-		// ── Strategy 3: Title/theme-based mix ───────────────────────────────
-		// Extract theme keywords from seed pool for broader but on-theme results
-		if (previousTrack.title) {
-			const allTitles = seedPool.map((s) => s.title).join(" ");
-			const keywords = allTitles
-				.toLowerCase()
-				.split(/[\s\-_()[\],]+/)
-				.filter((w) => w.length > 3)
-				.reduce((acc, w) => { acc.set(w, (acc.get(w) ?? 0) + 1); return acc; }, new Map<string, number>());
-
-			// Get the most common theme words from recent tracks
-			const themeWords = [...keywords.entries()]
-				.sort((a, b) => b[1] - a[1])
-				.slice(0, 3)
-				.map(([w]) => w)
-				.join(" ");
-
-			const searchQueries = [
-				{ source: "soundcloud", query: `${previousTrack.author} ${previousTrack.title}` },
-				{ source: "soundcloud", query: previousTrack.title },
-				...(themeWords ? [{ source: "soundcloud", query: themeWords }] : []),
-				{ source: "youtube", query: `${previousTrack.title} ${previousTrack.author}` },
-			];
-
-			for (const sq of searchQueries) {
-				const found = await tryMixSearch(sq);
-				if (found) {
-					commitTrack(found, `theme mix on ${sq.source}`);
-					return;
-				}
-			}
+		if (!foundAndPlayed) {
+			// All strategies exhausted
+			this.manager.emit("Debug", `[AutoMix] No suitable transition found, stopping.`);
+			player.playing = false;
+			this.manager.emit("QueueEnd", player, track, { type: "TrackEndEvent", reason: "finished" } as any);
 		}
-
-		// ── Strategy 4: YouTube Radio Mix (last resort) ─────────────────────
-		const hasYouTubeURL = ["youtube.com", "youtu.be"].some((url) =>
-			previousTrack.uri?.includes(url),
-		);
-		if (hasYouTubeURL) {
-			// Robust YouTube video ID extraction (handles /watch?v=ID, /shorts/ID, youtu.be/ID)
-			let videoID: string | null = null;
-			try {
-				const url = new URL(previousTrack.uri!);
-				if (url.hostname === "youtu.be") {
-					videoID = url.pathname.slice(1).split("/")[0] || null;
-				} else {
-					videoID = url.searchParams.get("v") ?? url.pathname.split("/").pop() ?? null;
-				}
-			} catch {
-				// Fallback regex for malformed URIs
-				const match = previousTrack.uri?.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-				videoID = match ? match[1] : null;
-			}
-
-			if (videoID && videoID.length >= 10) {
-				const randomIndex = Math.floor(Math.random() * 23) + 2;
-				const mixURI = `https://www.youtube.com/watch?v=${videoID}&list=RD${videoID}&index=${randomIndex}`;
-				const found = await tryMixSearch(mixURI);
-				if (found) {
-					commitTrack(found, "YouTube radio mix");
-					return;
-				}
-			}
-		}
-
-		// All strategies exhausted
-		this.manager.emit("Debug", `[AutoMix] No suitable transition found, stopping.`);
-		player.playing = false;
-		this.manager.emit("QueueEnd", player, track, { type: "TrackEndEvent", reason: "finished" } as any);
 	}
 
 	private async handleFailedTrack(player: StellaPlayer, track: Track, payload: TrackEndEvent): Promise<void> {
@@ -1454,3 +1601,80 @@ class StellaNode {
 }
 
 export { StellaNode };
+
+/**
+ * Normalizes title/text by converting to lowercase, stripping parenthetical and bracketed promotional tags
+ * (e.g. Official Video, Lyrics, Live, feat.), removing special characters/punctuation, and collapsing whitespace.
+ */
+export function normalizeText(text: string): string {
+	if (!text) return "";
+	return text
+		.toLowerCase()
+		// Remove parenthesized or bracketed suffixes like (Official Video), [Lyrics], (feat. ...), (Clip), etc.
+		.replace(/[\(\[][^\]\)]*\b(official|video|audio|lyrics|mv|hd|hq|visualizer|feat|ft|music|clip|lyric|screen|remix|version|acoustic|cover|instrumental|live)\b[^\]\)]*[\)\]]/gi, "")
+		// Remove everything after standalone feat. / ft.
+		.replace(/\b(feat|ft)\b.*/gi, "")
+		// Remove standalone common keyword patterns
+		.replace(/\b(official video|official audio|lyric video|music video|official lyric video|audio only)\b/gi, "")
+		// Strip symbols and punctuation, keeping alphanumeric characters and spaces across Unicode
+		.replace(/[^\p{L}\p{N}\s]/gu, "")
+		// Consolidate extra whitespace
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/**
+ * Normalizes author/artist name.
+ */
+export function normalizeAuthor(author: string): string {
+	if (!author) return "";
+	return author
+		.toLowerCase()
+		.replace(/\b(vevo|official|music|records|topic|channel|yt)\b/gi, "")
+		.replace(/[^\p{L}\p{N}\s]/gu, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+const STYLE_KEYWORDS = [
+	"lofi", "lo-fi", "phonk", "nightcore", "remix", "acoustic", "unplugged",
+	"instrumental", "piano", "violin", "orchestral", "sped up", "speed up",
+	"slowed", "reverb", "cover", "synthwave", "vaporwave", "metal", "rock",
+	"punk", "rap", "hip hop", "trap", "edm", "bass boosted", "dubstep", "house", "techno"
+];
+
+/**
+ * Detects style/genre keywords in the title text.
+ */
+export function getStyleProfile(title: string): Set<string> {
+	const lower = title.toLowerCase();
+	const styles = new Set<string>();
+	for (const keyword of STYLE_KEYWORDS) {
+		const regex = new RegExp(`\\b${keyword.replace("-", "\\-")}\\b`, "i");
+		if (regex.test(lower)) {
+			styles.add(keyword === "lo-fi" ? "lofi" : keyword);
+		}
+	}
+	if (lower.includes("lofi") || lower.includes("lo-fi")) {
+		styles.add("lofi");
+	}
+	if (lower.includes("sped up") || lower.includes("speed up")) {
+		styles.add("speed up");
+	}
+	return styles;
+}
+
+/**
+ * Returns character script profile for script/language tracking.
+ */
+export function getScriptProfile(text: string) {
+	const lower = text.toLowerCase();
+	return {
+		hasCJK: /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF\uAC00-\uD7AF]/.test(lower), // Japanese Kana/Kanji + Hanzi + Hangul
+		hasCyrillic: /[\u0400-\u04FF]/.test(lower),
+		hasThai: /[\u0E00-\u0E7F]/.test(lower),
+		hasArabic: /[\u0600-\u06FF]/.test(lower),
+		hasDevanagari: /[\u0900-\u097F]/.test(lower),
+	};
+}
+

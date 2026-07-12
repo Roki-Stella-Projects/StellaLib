@@ -502,6 +502,8 @@ export interface PlayerPersistData {
 	botUserId: string | null;
 	autoplayHistory: string[];
 	autoplaySeedPool: { title: string; author: string; uri: string; duration: number; sourceName: string }[];
+	autoplayDiscoveryMode?: "radio" | "balanced" | "discovery";
+	autoplaySkippedHistory?: string[];
 	queue: TrackPersistData[];
 	filters: {
 		distortion: object | null;
