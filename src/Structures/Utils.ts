@@ -79,7 +79,7 @@ abstract class TrackUtils {
 	 * @param data The raw data from Lavalink.
 	 * @param requester The user who requested the track.
 	 */
-	static build(data: TrackData, requester?: string): Track {
+	static build(data: TrackData, requester?: any): Track {
 		if (typeof data === "undefined")
 			throw new RangeError('Argument "data" must be present.');
 
@@ -137,7 +137,7 @@ abstract class TrackUtils {
 	 * @param query The query to search for.
 	 * @param requester The user who requested the track.
 	 */
-	static buildUnresolved(query: string | UnresolvedQuery, requester?: string): UnresolvedTrack {
+	static buildUnresolved(query: string | UnresolvedQuery, requester?: any): UnresolvedTrack {
 		if (typeof query === "undefined")
 			throw new RangeError('Argument "query" must be present.');
 

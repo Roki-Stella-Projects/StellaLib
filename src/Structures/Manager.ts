@@ -82,6 +82,24 @@ export class Collection<K, V> extends Map<K, V> {
  * The main hub for interacting with Lavalink using StellaLib.
  */
 class StellaManager extends TypedEmitter<ManagerEvents> {
+	public override emit<U extends keyof ManagerEvents>(
+		event: U,
+		...args: Parameters<ManagerEvents[U]>
+	): boolean {
+		const result = super.emit(event, ...args);
+
+		// If it is a PascalCase event, also emit the camelCase version
+		if (typeof event === "string" && event.length > 0) {
+			const firstChar = event.charAt(0);
+			if (firstChar === firstChar.toUpperCase()) {
+				const camelEvent = (firstChar.toLowerCase() + event.slice(1)) as any;
+				super.emit(camelEvent, ...args);
+			}
+		}
+
+		return result;
+	}
+
 	public static readonly DEFAULT_SOURCES: Record<SearchPlatform, string> = {
 		"youtube music": "ytmsearch",
 		youtube: "ytsearch",
@@ -431,7 +449,7 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 	 */
 	public async search(
 		query: string | SearchQuery,
-		requester?: string,
+		requester?: any,
 	): Promise<SearchResult> {
 		const node = this.useableNodes;
 		if (!node) throw new Error("No available nodes.");
@@ -621,7 +639,7 @@ class StellaManager extends TypedEmitter<ManagerEvents> {
 	 */
 	public async lavaSearch(
 		query: string | LavaSearchQuery,
-		requester?: string,
+		requester?: any,
 	): Promise<LavaSearchResult> {
 		const node = this.useableNodes;
 		if (!node) throw new Error("No available nodes.");

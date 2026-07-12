@@ -181,7 +181,7 @@ export class StellaPlayer {
 	 * @param query The query to search.
 	 * @param requester The user who requested the search.
 	 */
-	public search(query: string | SearchQuery, requester?: string): Promise<SearchResult> {
+	public search(query: string | SearchQuery, requester?: any): Promise<SearchResult> {
 		return this.manager.search(query, requester);
 	}
 
@@ -555,7 +555,7 @@ export class StellaPlayer {
 	 * @param track
 	 * @param requester
 	 */
-	public async getRecommended(track: Track, requester?: string): Promise<Track[] | undefined> {
+	public async getRecommended(track: Track, requester?: any): Promise<Track[] | undefined> {
 		const node = this.manager.useableNodes;
 		if (!node) throw new Error("No available nodes.");
 

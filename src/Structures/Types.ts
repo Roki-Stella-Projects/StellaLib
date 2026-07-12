@@ -81,7 +81,7 @@ export interface Track {
 	/** The thumbnail of the track or null if unsupported source. */
 	readonly thumbnail: string | null;
 	/** The user that requested the track. */
-	readonly requester: string | null | undefined;
+	readonly requester: any;
 	/** Displays the track thumbnail with optional size. */
 	displayThumbnail(size?: Sizes): string | null;
 	/** Additional track info provided by plugins. */
@@ -614,6 +614,8 @@ export interface ManagerOptions {
 		/** Maximum burst size (tokens in bucket). Default: 40. */
 		bucketSize?: number;
 	};
+	autoMove?: boolean;
+	autoResume?: boolean;
 	/**
 	 * Function to send data to the Discord websocket.
 	 * @param id Guild ID
@@ -739,4 +741,24 @@ export interface ManagerEvents {
 	NodeZombie: (node: any, playersAffected: number, lastUpdate: number) => void;
 	/** Emitted when a player's voice connection is automatically re-identified after Discord voice rotation. */
 	VoiceReconnect: (player: any, code: number) => void;
+
+	nodeCreate: (node: any) => void;
+	nodeDestroy: (node: any) => void;
+	nodeConnect: (node: any) => void;
+	nodeReconnect: (node: any) => void;
+	nodeDisconnect: (node: any, reason: { code?: number; reason?: string }) => void;
+	nodeError: (node: any, error: Error) => void;
+	nodeRaw: (payload: unknown) => void;
+	playerCreate: (player: any) => void;
+	playerDestroy: (player: any) => void;
+	playerStateUpdate: (oldPlayer: any, newPlayer: any) => void;
+	playerMove: (player: any, initChannel: string, newChannel: string) => void;
+	playerDisconnect: (player: any, oldChannel: string) => void;
+	queueEnd: (player: any, track: Track | UnresolvedTrack, payload: TrackEndEvent) => void;
+	socketClosed: (player: any, payload: WebSocketClosedEvent) => void;
+	trackStart: (player: any, track: Track, payload: TrackStartEvent) => void;
+	trackEnd: (player: any, track: Track, payload: TrackEndEvent) => void;
+	trackStuck: (player: any, track: Track, payload: TrackStuckEvent) => void;
+	trackError: (player: any, track: Track | UnresolvedTrack, payload: TrackExceptionEvent | unknown) => void;
+	playerFailover: (player: any, oldNode: string, newNode: string) => void;
 }
