@@ -1179,6 +1179,39 @@ class StellaNode {
 				const isQuickSkipped = player.autoplaySkippedHistory?.includes(titleAuthorKey);
 				if (isQuickSkipped) return false;
 
+				// Exclude exact or highly similar titles to prevent playing different versions/covers/re-uploads of the same song
+				const normPrevTitle = normalizeText(previousTrack.title ?? "");
+				if (normCandTitle === normPrevTitle || normCandTitle.includes(normPrevTitle) || normPrevTitle.includes(normCandTitle)) {
+					return false;
+				}
+
+				// Check Jaccard similarity for title words to filter out covers/remixes with slightly modified titles
+				const candWords = normCandTitle.split(/\s+/).filter(w => w.length > 2);
+				const prevWords = normPrevTitle.split(/\s+/).filter(w => w.length > 2);
+				if (candWords.length > 0 && prevWords.length > 0) {
+					const intersect = candWords.filter(w => prevWords.includes(w)).length;
+					const union = new Set([...candWords, ...prevWords]).size;
+					if (intersect / union > 0.4) {
+						return false;
+					}
+				}
+
+				// Exclude same song from the seed pool
+				const isSameSongInSeed = seedPool.some(s => {
+					const normSeedTitle = normalizeText(s.title ?? "");
+					if (normCandTitle === normSeedTitle || normCandTitle.includes(normSeedTitle) || normSeedTitle.includes(normCandTitle)) {
+						return true;
+					}
+					const seedWords = normSeedTitle.split(/\s+/).filter(w => w.length > 2);
+					if (candWords.length > 0 && seedWords.length > 0) {
+						const intersect = candWords.filter(w => seedWords.includes(w)).length;
+						const union = new Set([...candWords, ...seedWords]).size;
+						if (intersect / union > 0.4) return true;
+					}
+					return false;
+				});
+				if (isSameSongInSeed) return false;
+
 				// Avoid playing tracks currently in the seed pool
 				const inSeedPool = seedPool.some(s => {
 					const sTitle = normalizeText(s.title ?? "");
