@@ -210,11 +210,12 @@ class StellaNode {
 			});
 			if (res.ok) {
 				const versionStr = (await res.text()).trim();
-				this.version = 3;
-				this.rest.setVersion(3);
+				const isV3 = versionStr.startsWith("3");
+				this.version = isV3 ? 3 : 4;
+				this.rest.setVersion(isV3 ? 3 : 4);
 				this.manager.emit(
 					"Debug",
-					`[Node:${this.options.identifier}] Detected Lavalink v3 (${versionStr})`,
+					`[Node:${this.options.identifier}] Detected Lavalink ${isV3 ? "v3" : "v4"} via version string (${versionStr})`,
 				);
 				return;
 			}
@@ -998,9 +999,92 @@ class StellaNode {
 			for (const s of styles) seedStyles.add(s);
 		}
 
+		// Determine the user's preferred search source dynamically
+		const primarySource = this.manager.options.defaultSearchPlatform ?? "youtube music";
+
+		// Helper to calculate Jaccard similarity between title words
+		const getJaccardSimilarity = (s1: string, s2: string): number => {
+			const w1 = s1.split(/\s+/).filter(w => w.length > 2);
+			const w2 = s2.split(/\s+/).filter(w => w.length > 2);
+			if (w1.length === 0 || w2.length === 0) return 0;
+			const intersect = w1.filter(w => w2.includes(w)).length;
+			const union = new Set([...w1, ...w2]).size;
+			return intersect / union;
+		};
+
+		// Helper to find the recency of tracks/artists/similar titles in history (most recent = 1)
+		const getHistoryRecency = (candidateTrack: Track) => {
+			const normCandTitle = normalizeText(candidateTrack.title ?? "");
+			const normCandAuthor = normalizeAuthor(candidateTrack.author ?? "");
+			const uriKey = candidateTrack.uri;
+
+			let trackRecency = Infinity;
+			let artistRecency = Infinity;
+			let titleSimRecency = Infinity;
+			let maxTitleSim = 0;
+
+			const len = player.autoplayHistory.length;
+			let recentTitlesCount = 0;
+			let recentArtistsCount = 0;
+
+			for (let i = len - 1; i >= 0; i--) {
+				const entry = player.autoplayHistory[i];
+				const posFromEnd = len - i;
+
+				if (entry.includes("::")) {
+					const [playedTitle, playedAuthor] = entry.split("::");
+					recentTitlesCount++;
+					recentArtistsCount++;
+
+					if (playedAuthor === normCandAuthor && artistRecency === Infinity) {
+						artistRecency = recentArtistsCount;
+					}
+
+					if (playedTitle === normCandTitle && trackRecency === Infinity) {
+						trackRecency = recentTitlesCount;
+					}
+
+					const sim = getJaccardSimilarity(normCandTitle, playedTitle);
+					if (sim > maxTitleSim) {
+						maxTitleSim = sim;
+						if (sim > 0.35 && titleSimRecency === Infinity) {
+							titleSimRecency = recentTitlesCount;
+						}
+					}
+				} else {
+					if (entry === uriKey && trackRecency === Infinity) {
+						trackRecency = posFromEnd;
+					}
+				}
+			}
+
+			return { trackRecency, artistRecency, titleSimRecency, maxTitleSim };
+		};
+
 		// ── Transition scoring engine ───────────────────────────────────────
 		const scoreTrack = (candidate: Track): number => {
-			let score = 0;
+			let score = 100; // Base score (starts at 100)
+
+			// ── Recency Penalties (Spotify Fewer Repeats / Freshness Scoring) ───
+			const { trackRecency, artistRecency, titleSimRecency, maxTitleSim } = getHistoryRecency(candidate);
+
+			// 1. Exact Track Recency Penalty (heavy penalty if played recently)
+			if (trackRecency !== Infinity) {
+				const penalty = Math.max(0, 180 - (trackRecency - 1) * 15);
+				score -= penalty;
+			}
+
+			// 2. Artist Recency Penalty (penalize playing same artist too close)
+			if (artistRecency !== Infinity) {
+				const penalty = Math.max(0, 90 - (artistRecency - 1) * 10);
+				score -= penalty;
+			}
+
+			// 3. Title Similarity Recency Penalty (penalize playing similar titles recently)
+			if (titleSimRecency !== Infinity && maxTitleSim > 0.35) {
+				const penalty = Math.max(0, (maxTitleSim * 120) - (titleSimRecency - 1) * 10);
+				score -= penalty;
+			}
 
 			// Duration similarity: ±30s = +20, ±60s = +12, ±120s = +5
 			const durDiff = Math.abs((candidate.duration ?? 0) - avgDuration);
@@ -1094,25 +1178,17 @@ class StellaNode {
 			const normPrevAuthor = normalizeAuthor(previousTrack.author ?? "");
 			const authorRepeatCount = recentAuthors.filter((a) => a === normCandAuthor).length;
 
-			if (discoveryMode === "radio") {
-				// Strongly favor same artist, no diversity penalties
-				if (normCandAuthor === normPrevAuthor) {
-					score += 35;
+			// Spacing algorithm - soft penalty instead of hard exclusion
+			if (normCandAuthor && previousTrack.author) {
+				const authorMatch = normCandAuthor === normPrevAuthor;
+				if (authorMatch) {
+					if (discoveryMode === "discovery") score -= 40;
+					else if (discoveryMode === "balanced") score -= 20;
+					else if (discoveryMode === "radio") score += 35; // Strongly favor same artist
 				}
-				// Penalize style changes heavily
-				const candStyles = getStyleProfile(candidate.title ?? "");
-				for (const cs of candStyles) {
-					if (!seedStyles.has(cs)) {
-						score -= 50;
-					} else {
-						score += 15;
-					}
-				}
-			} else if (discoveryMode === "discovery") {
-				// Penalize same artist, reward fresh ones
-				if (normCandAuthor === normPrevAuthor) {
-					score -= 20;
-				}
+			}
+
+			if (discoveryMode === "discovery") {
 				if (authorRepeatCount === 0 && normCandAuthor !== normPrevAuthor) {
 					score += 35; // Discovery bonus — fresh artist
 				} else if (authorRepeatCount === 1) {
@@ -1129,16 +1205,22 @@ class StellaNode {
 						score += 25;
 					}
 				}
+			} else if (discoveryMode === "radio") {
+				// Penalize style changes heavily
+				const candStyles = getStyleProfile(candidate.title ?? "");
+				for (const cs of candStyles) {
+					if (!seedStyles.has(cs)) {
+						score -= 50;
+					} else {
+						score += 15;
+					}
+				}
 			} else {
 				// balanced (default)
-				if (normPrevAuthor && normCandAuthor) {
-					if (normCandAuthor === normPrevAuthor) {
-						score += 25;
-					} else {
-						const prevWords = normPrevAuthor.split(/\s+/).filter((w) => w.length > 2);
-						const overlap = prevWords.filter((w) => normCandAuthor.includes(w) || normCandAuthor.split(/\s+/).includes(w)).length;
-						score += Math.min(overlap * 8, 16);
-					}
+				if (normPrevAuthor && normCandAuthor && normCandAuthor !== normPrevAuthor) {
+					const prevWords = normPrevAuthor.split(/\s+/).filter((w) => w.length > 2);
+					const overlap = prevWords.filter((w) => normCandAuthor.includes(w) || normCandAuthor.split(/\s+/).includes(w)).length;
+					score += Math.min(overlap * 8, 16);
 				}
 				if (authorRepeatCount === 0 && normCandAuthor !== normPrevAuthor) {
 					score += 15;
@@ -1160,65 +1242,36 @@ class StellaNode {
 				}
 			}
 
+			// Soft deduplication penalty for title/artist similarity to the previous track
+			// (prevents playing different versions/covers/re-uploads of the same song)
+			const jaccardPrevTitle = getJaccardSimilarity(normCandTitle, normPrevTitle);
+			if (normCandTitle === normPrevTitle || normCandTitle.includes(normPrevTitle) || normPrevTitle.includes(normCandTitle)) {
+				score -= 100;
+			}
+			if (jaccardPrevTitle > 0.4) {
+				score -= 100 * jaccardPrevTitle;
+			}
+
 			return score;
 		};
 
 		// Helper: filter out history + current/previous, score & rank, return best
 		const pickBestTransition = (tracks: Track[]): Track | undefined => {
 			const eligible = tracks.filter((t) => {
+				// Hard filter only:
+				// - Exact URI matching active track or immediate previous
 				if (t.uri === previousTrack.uri || t.uri === track.uri) return false;
-				if (historySet.has(t.uri)) return false;
+
+				// - Exact URI already in active queue
+				if (player.queue.some((item) => item.uri === t.uri)) return false;
 
 				const normCandTitle = normalizeText(t.title ?? "");
 				const normCandAuthor = normalizeAuthor(t.author ?? "");
 				const titleAuthorKey = `${normCandTitle}::${normCandAuthor}`;
 
-				if (historySet.has(titleAuthorKey)) return false;
-
-				// Exclude quick-skipped tracks
+				// - Quick-skipped tracks
 				const isQuickSkipped = player.autoplaySkippedHistory?.includes(titleAuthorKey);
 				if (isQuickSkipped) return false;
-
-				// Exclude exact or highly similar titles to prevent playing different versions/covers/re-uploads of the same song
-				const normPrevTitle = normalizeText(previousTrack.title ?? "");
-				if (normCandTitle === normPrevTitle || normCandTitle.includes(normPrevTitle) || normPrevTitle.includes(normCandTitle)) {
-					return false;
-				}
-
-				// Check Jaccard similarity for title words to filter out covers/remixes with slightly modified titles
-				const candWords = normCandTitle.split(/\s+/).filter(w => w.length > 2);
-				const prevWords = normPrevTitle.split(/\s+/).filter(w => w.length > 2);
-				if (candWords.length > 0 && prevWords.length > 0) {
-					const intersect = candWords.filter(w => prevWords.includes(w)).length;
-					const union = new Set([...candWords, ...prevWords]).size;
-					if (intersect / union > 0.4) {
-						return false;
-					}
-				}
-
-				// Exclude same song from the seed pool
-				const isSameSongInSeed = seedPool.some(s => {
-					const normSeedTitle = normalizeText(s.title ?? "");
-					if (normCandTitle === normSeedTitle || normCandTitle.includes(normSeedTitle) || normSeedTitle.includes(normCandTitle)) {
-						return true;
-					}
-					const seedWords = normSeedTitle.split(/\s+/).filter(w => w.length > 2);
-					if (candWords.length > 0 && seedWords.length > 0) {
-						const intersect = candWords.filter(w => seedWords.includes(w)).length;
-						const union = new Set([...candWords, ...seedWords]).size;
-						if (intersect / union > 0.4) return true;
-					}
-					return false;
-				});
-				if (isSameSongInSeed) return false;
-
-				// Avoid playing tracks currently in the seed pool
-				const inSeedPool = seedPool.some(s => {
-					const sTitle = normalizeText(s.title ?? "");
-					const sAuthor = normalizeAuthor(s.author ?? "");
-					return `${sTitle}::${sAuthor}` === titleAuthorKey;
-				});
-				if (inSeedPool) return false;
 
 				return true;
 			});
@@ -1227,13 +1280,13 @@ class StellaNode {
 			const scored = eligible.map((t) => ({ track: t, score: scoreTrack(t) }));
 			scored.sort((a, b) => b.score - a.score);
 
-			// Pick from top 3 with slight randomness for variety
+			// Pick from top 3 with slight randomness for variety (Spotify smart randomness)
 			const topN = scored.slice(0, Math.min(3, scored.length));
 			const pick = topN[Math.floor(Math.random() * topN.length)];
 
 			this.manager.emit(
 				"Debug",
-				`[AutoMix] Best candidates: ${scored.slice(0, 5).map((s) => `"${s.track.title}" (${s.score}pts)`).join(", ")}`,
+				`[AutoMix] Best candidates: ${scored.slice(0, 5).map((s) => `"${s.track.title}" (${Math.round(s.score)}pts)`).join(", ")}`,
 			);
 
 			return pick?.track;
@@ -1335,17 +1388,27 @@ class StellaNode {
 									commitTrack(picked, "Spotify rec (direct)");
 									return true;
 								}
-								// Fallback: re-search on SoundCloud for a streamable version
-								const streamable = await tryMixSearch({ source: "soundcloud", query: `${picked.author} ${picked.title}` }, minScore);
+								// Fallback: re-search on primary source first
+								const streamable = await tryMixSearch({ source: primarySource, query: `${picked.author} ${picked.title}` }, minScore);
 								if (streamable) {
-									commitTrack(streamable, "Spotify rec → SoundCloud");
+									commitTrack(streamable, `Spotify rec → ${primarySource}`);
 									return true;
 								}
-								// Fallback: try YouTube
-								const ytFallback = await tryMixSearch({ source: "youtube", query: `${picked.author} ${picked.title}` }, minScore);
-								if (ytFallback) {
-									commitTrack(ytFallback, "Spotify rec → YouTube");
-									return true;
+								// Fallback 2: SoundCloud
+								if (primarySource !== "soundcloud") {
+									const scFallback = await tryMixSearch({ source: "soundcloud", query: `${picked.author} ${picked.title}` }, minScore);
+									if (scFallback) {
+										commitTrack(scFallback, "Spotify rec → SoundCloud");
+										return true;
+									}
+								}
+								// Fallback 3: YouTube
+								if (primarySource !== "youtube") {
+									const ytFallback = await tryMixSearch({ source: "youtube", query: `${picked.author} ${picked.title}` }, minScore);
+									if (ytFallback) {
+										commitTrack(ytFallback, "Spotify rec → YouTube");
+										return true;
+									}
 								}
 							}
 						}
@@ -1355,97 +1418,13 @@ class StellaNode {
 				}
 			}
 
-			// ── Strategy 2: Author-based mix ────────────────────────────────────
-			// Build diverse search queries from the seed pool to keep the mix flowing
-			if (previousTrack.author) {
-				const uniqueAuthors = [...new Set(seedPool.map((s) => s.author).filter(Boolean))];
-
-				// Extract meaningful title keywords (skip noise words) for search context
-				const titleKeywords = (previousTrack.title ?? "")
-					.split(/[\s\-_()[\],.'"!?]+/)
-					.filter((w) => w.length > 2 && !/^(feat|ft|remix|version|official|video|audio|lyrics|mv|hd|hq|high|school|the|and|for)$/i.test(w))
-					.slice(0, 3)
-					.join(" ");
-
-				// Determine if author name is too short/generic for a standalone search
-				// Strip punctuation/symbols to measure actual content length
-				const strippedAuthor = previousTrack.author.replace(/[^\p{L}\p{N}]/gu, "");
-				const isShortAuthor = strippedAuthor.length <= 5;
-
-				const searchQueries: { source: string; query: string }[] = [];
-
-				// Always try author + title keywords first — most targeted, avoids generic name pollution
-				if (titleKeywords) {
-					searchQueries.push({ source: "soundcloud", query: `${previousTrack.author} ${titleKeywords}` });
-				}
-				// Only use bare author name if it's long/unique enough to be a meaningful search term
-				if (!isShortAuthor) {
-					searchQueries.push({ source: "soundcloud", query: previousTrack.author });
-				}
-				// Cross-artist from seed pool (also with title context for short names)
-				if (uniqueAuthors.length > 1) {
-					const altAuthor = uniqueAuthors.find((a) => a !== previousTrack.author);
-					if (altAuthor) {
-						const altStripped = altAuthor.replace(/[^\p{L}\p{N}]/gu, "");
-						if (altStripped.length > 5) {
-							searchQueries.push({ source: "soundcloud", query: altAuthor });
-						} else if (titleKeywords) {
-							searchQueries.push({ source: "soundcloud", query: `${altAuthor} ${titleKeywords}` });
-						}
-					}
-				}
-				// YouTube fallback
-				searchQueries.push({ source: "youtube", query: `${previousTrack.author} ${titleKeywords || "music"}` });
-
-				for (const sq of searchQueries) {
-					const found = await tryMixSearch(sq, minScore);
-					if (found) {
-						commitTrack(found, `author mix on ${sq.source}`);
-						return true;
-					}
-				}
-			}
-
-			// ── Strategy 3: Title/theme-based mix ───────────────────────────────
-			// Extract theme keywords from seed pool for broader but on-theme results
-			if (previousTrack.title) {
-				const allTitles = seedPool.map((s) => s.title).join(" ");
-				const keywords = allTitles
-					.toLowerCase()
-					.split(/[\s\-_()[\],]+/)
-					.filter((w) => w.length > 3)
-					.reduce((acc, w) => { acc.set(w, (acc.get(w) ?? 0) + 1); return acc; }, new Map<string, number>());
-
-				// Get the most common theme words from recent tracks
-				const themeWords = [...keywords.entries()]
-					.sort((a, b) => b[1] - a[1])
-					.slice(0, 3)
-					.map(([w]) => w)
-					.join(" ");
-
-				const searchQueries = [
-					{ source: "soundcloud", query: `${previousTrack.author} ${previousTrack.title}` },
-					{ source: "soundcloud", query: previousTrack.title },
-					...(themeWords ? [{ source: "soundcloud", query: themeWords }] : []),
-					{ source: "youtube", query: `${previousTrack.title} ${previousTrack.author}` },
-				];
-
-				for (const sq of searchQueries) {
-					const found = await tryMixSearch(sq, minScore);
-					if (found) {
-						commitTrack(found, `theme mix on ${sq.source}`);
-						return true;
-					}
-				}
-			}
-
-			// ── Strategy 4: YouTube Radio Mix (last resort) ─────────────────────
+			// ── Strategy 2: YouTube Radio Mix ───────────────────────────────────
+			let videoID: string | null = null;
 			const hasYouTubeURL = ["youtube.com", "youtu.be"].some((url) =>
 				previousTrack.uri?.includes(url),
 			);
 			if (hasYouTubeURL) {
 				// Robust YouTube video ID extraction (handles /watch?v=ID, /shorts/ID, youtu.be/ID)
-				let videoID: string | null = null;
 				try {
 					const url = new URL(previousTrack.uri!);
 					if (url.hostname === "youtu.be") {
@@ -1458,13 +1437,135 @@ class StellaNode {
 					const match = previousTrack.uri?.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
 					videoID = match ? match[1] : null;
 				}
+			} else {
+				// If the seed track is not from YouTube, search YouTube to resolve a video ID
+				try {
+					const searchRes = await player.search({ source: "youtube", query: `${previousTrack.author} ${previousTrack.title}` }, requester);
+					if (searchRes.loadType === "search" || searchRes.loadType === "track" || searchRes.loadType === "playlist") {
+						const firstTrack = searchRes.tracks[0];
+						if (firstTrack && firstTrack.uri) {
+							const match = firstTrack.uri.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+							if (match) videoID = match[1];
+						}
+					}
+				} catch {
+					// Ignore search failure
+				}
+			}
 
-				if (videoID && videoID.length >= 10) {
-					const randomIndex = Math.floor(Math.random() * 23) + 2;
-					const mixURI = `https://www.youtube.com/watch?v=${videoID}&list=RD${videoID}&index=${randomIndex}`;
-					const found = await tryMixSearch(mixURI, minScore);
+			if (videoID && videoID.length >= 10) {
+				const randomIndex = Math.floor(Math.random() * 23) + 2;
+				const mixURI = `https://www.youtube.com/watch?v=${videoID}&list=RD${videoID}&index=${randomIndex}`;
+				const found = await tryMixSearch(mixURI, minScore);
+				if (found) {
+					commitTrack(found, "YouTube radio mix");
+					return true;
+				}
+			}
+
+			// ── Strategy 3: Author-based mix ────────────────────────────────────
+			if (previousTrack.author) {
+				const uniqueAuthors = [...new Set(seedPool.map((s) => s.author).filter(Boolean))];
+
+				// Extract meaningful title keywords (skip noise words) for search context
+				const titleKeywords = (previousTrack.title ?? "")
+					.split(/[\s\-_()[\],.'"!?]+/)
+					.filter((w) => w.length > 2 && !/^(feat|ft|remix|version|official|video|audio|lyrics|mv|hd|hq|high|school|the|and|for)$/i.test(w))
+					.slice(0, 3)
+					.join(" ");
+
+				const strippedAuthor = previousTrack.author.replace(/[^\p{L}\p{N}]/gu, "");
+				const isShortAuthor = strippedAuthor.length <= 5;
+
+				const searchQueries: { source: string; query: string }[] = [];
+
+				// 1. Try primary source (e.g. YouTube Music / Spotify) first
+				if (titleKeywords) {
+					searchQueries.push({ source: primarySource, query: `${previousTrack.author} ${titleKeywords}` });
+				}
+				if (!isShortAuthor) {
+					searchQueries.push({ source: primarySource, query: previousTrack.author });
+				}
+
+				// 2. Try SoundCloud next as fallback if primary is not SoundCloud
+				if (primarySource !== "soundcloud") {
+					if (titleKeywords) {
+						searchQueries.push({ source: "soundcloud", query: `${previousTrack.author} ${titleKeywords}` });
+					}
+					if (!isShortAuthor) {
+						searchQueries.push({ source: "soundcloud", query: previousTrack.author });
+					}
+				}
+
+				// 3. Cross-artist from seed pool
+				if (uniqueAuthors.length > 1) {
+					const altAuthor = uniqueAuthors.find((a) => a !== previousTrack.author);
+					if (altAuthor) {
+						const altStripped = altAuthor.replace(/[^\p{L}\p{N}]/gu, "");
+						if (altStripped.length > 5) {
+							searchQueries.push({ source: primarySource, query: altAuthor });
+							if (primarySource !== "soundcloud") {
+								searchQueries.push({ source: "soundcloud", query: altAuthor });
+							}
+						} else if (titleKeywords) {
+							searchQueries.push({ source: primarySource, query: `${altAuthor} ${titleKeywords}` });
+							if (primarySource !== "soundcloud") {
+								searchQueries.push({ source: "soundcloud", query: `${altAuthor} ${titleKeywords}` });
+							}
+						}
+					}
+				}
+
+				// 4. YouTube fallback as final fallback
+				if (primarySource !== "youtube") {
+					searchQueries.push({ source: "youtube", query: `${previousTrack.author} ${titleKeywords || "music"}` });
+				}
+
+				for (const sq of searchQueries) {
+					const found = await tryMixSearch(sq, minScore);
 					if (found) {
-						commitTrack(found, "YouTube radio mix");
+						commitTrack(found, `author mix on ${sq.source}`);
+						return true;
+					}
+				}
+			}
+
+			// ── Strategy 4: Title/theme-based mix ───────────────────────────────
+			if (previousTrack.title) {
+				const allTitles = seedPool.map((s) => s.title).join(" ");
+				const keywords = allTitles
+					.toLowerCase()
+					.split(/[\s\-_()[\],]+/)
+					.filter((w) => w.length > 3)
+					.reduce((acc, w) => { acc.set(w, (acc.get(w) ?? 0) + 1); return acc; }, new Map<string, number>());
+
+				const themeWords = [...keywords.entries()]
+					.sort((a, b) => b[1] - a[1])
+					.slice(0, 3)
+					.map(([w]) => w)
+					.join(" ");
+
+				const searchQueries = [
+					{ source: primarySource, query: `${previousTrack.author} ${previousTrack.title}` },
+					{ source: primarySource, query: previousTrack.title },
+					...(themeWords ? [{ source: primarySource, query: themeWords }] : []),
+				];
+
+				if (primarySource !== "soundcloud") {
+					searchQueries.push(
+						{ source: "soundcloud", query: `${previousTrack.author} ${previousTrack.title}` },
+						{ source: "soundcloud", query: previousTrack.title },
+					);
+				}
+
+				if (primarySource !== "youtube") {
+					searchQueries.push({ source: "youtube", query: `${previousTrack.title} ${previousTrack.author}` });
+				}
+
+				for (const sq of searchQueries) {
+					const found = await tryMixSearch(sq, minScore);
+					if (found) {
+						commitTrack(found, `theme mix on ${sq.source}`);
 						return true;
 					}
 				}
