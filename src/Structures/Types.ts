@@ -161,6 +161,11 @@ export interface NodeOptions {
 	 * Default: false.
 	 */
 	wsCompression?: boolean;
+	/**
+	 * Trust self-signed or unauthorized TLS/SSL certificates.
+	 * Default: false.
+	 */
+	isTrusted?: boolean;
 }
 
 export interface NodeStats {

@@ -236,6 +236,10 @@ class StellaNode {
 	public async connect(): Promise<void> {
 		if (this.connected) return;
 
+		if (this.options.secure && this.options.isTrusted) {
+			process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+		}
+
 		// Auto-detect Lavalink version before connecting
 		await this.detectVersion();
 
@@ -278,6 +282,10 @@ class StellaNode {
 		this.manager.emit("Debug", `[Node:${this.options.identifier}] Connecting to ${url}${this.sessionId ? " (resuming)" : ""}`);
 
 		const wsOptions: WebSocket.ClientOptions = { headers };
+
+		if (this.options.secure && this.options.isTrusted !== undefined) {
+			wsOptions.rejectUnauthorized = !this.options.isTrusted;
+		}
 
 		// Enable per-message deflate compression if configured
 		if (this.options.wsCompression) {
@@ -573,9 +581,10 @@ class StellaNode {
 		}
 	}
 
-	protected error(error: Error): void {
+	protected error(error: any): void {
 		if (!error) return;
-		this.manager.emit("NodeError", this, error);
+		const actualError = error.error || error;
+		this.manager.emit("NodeError", this, actualError);
 	}
 
 	protected message(d: Buffer | string): void {
